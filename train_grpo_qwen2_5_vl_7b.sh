@@ -7,7 +7,7 @@ export RAY_TMPDIR=~/sangmin/ray_tmp
 export WANDB_API_KEY='8d955a8fe09693b7a2e983616a79aae912307d79'
 
 
-model_path=./merged_model_grpo
+model_path=./merged_model_grpo_step50
 #model_path=Qwen/Qwen2.5-VL-7B-Instruct
 #n_gpus=$(nvidia-smi -L | wc -l)
 #for test
@@ -25,8 +25,8 @@ n_gpus=4
 
 train_batch_size=64
 #ppo_mini_batch_size=$((4 * n_gpus)) #4= gpu에 올릴 데이터 개수
-ppo_mini_batch_size=32 #수정( 4*4)
-ppo_micro_batch_size_per_gpu=8
+ppo_mini_batch_size=16 #수정( 4*4)
+ppo_micro_batch_size_per_gpu=4
 log_prob_micro_batch_size_per_gpu=8
 #n_agent=5
 n_agent=8 #수정
@@ -42,7 +42,7 @@ val_before_train=False
 search_url="http://163.239.28.21:5002/search"
 # search_url='http://127.0.0.1:5000/search'
 rm_url="http://0.0.0.0:8003/eval"
-max_turns=5
+max_turns=10
 project_name="vrag"
 experiment_name="SFT_w_crop_${n_gpus}_gpus_${max_turns}_maxturns_${n_agent}_ngroups_qwen2_5_vl_7b"
 
@@ -123,7 +123,8 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=10 \
     trainer.test_freq=1000000 \
     trainer.total_epochs=1 \
-    trainer.resume_mode=disable \
+    trainer.resume_mode=auto \
+    trainer.resume_from_path=./checkpoints/vrag_test/my_run/global_step_10 \
     trainer.val_before_train=$val_before_train \
     retriever.url=$search_url \
     max_turns=$max_turns $@
