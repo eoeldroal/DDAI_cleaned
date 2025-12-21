@@ -5,6 +5,8 @@ test.sh
 
 **/*.jpg
 
+**/RL_results
+
 **/*.pt
 **/checkpoints
 **/wget-log
@@ -27,6 +29,7 @@ tensorflow/my_graph/*
 .idea/
 # C extensions
 *.so
+**/logs
 
 # Distribution / packaging
 .Python

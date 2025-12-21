@@ -151,6 +151,10 @@ class RMManager:
         #reward_tensor는 최종 점수들을 담을 '성적표'
         reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
 
+        # 수정 wandb 로깅
+        ndcg_list = []
+        llm_judge_list = []
+
         already_print_data_sources = {}
 
         #수정 추가: log 작성#
@@ -276,6 +280,11 @@ class RMManager:
             model_eval_score = eval_results.pop(0)
                 
             final_score = 0.2*model_eval_score + 0.8*ndcg_value
+            
+            # 수정 wandb 로깅
+            ndcg_list.append(ndcg_value)
+            llm_judge_list.append(model_eval_score)
+
             ################수정 완료(주석처리) #################
 
             reward_tensor[i, valid_response_length - 1] = final_score
@@ -370,5 +379,14 @@ class RMManager:
             json.dump(log_data, f, ensure_ascii=False, indent=2)            
         ###수정 추가 끝: log 작성#
 
+        # 수정 wandb 로깅
+        metrics = {
+            'train/score/ndcg': np.mean(ndcg_list) if ndcg_list else 0.0,
+            'train/score/llm_judge': np.mean(llm_judge_list) if llm_judge_list else 0.0
+        }
 
-        return reward_tensor
+        # 수정 wandb 로깅기존에는 reward_tensor만 리턴했지만, 이제 metrics도 함께 리턴
+        return reward_tensor, metrics
+
+
+        

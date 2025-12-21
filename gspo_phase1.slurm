@@ -4,10 +4,10 @@
 #SBATCH --job-name=vrag_grpo          # 작업 이름 (원하는 대로 수정)
 #SBATCH --nodes=1                     # 노드 수 (srun --nodes=1)
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=4
+#SBATCH --gpus-per-node=2
 #SBATCH --cpus-per-task=32            # CPU 코어 수 (srun --cpus-per-task=32)
 #SBATCH --mem=480G                    # 메모리 (srun --mem=480G)
-#SBATCH --time=20:00:00               # 제한 시간 (srun --time=4:00:00)
+#SBATCH --time=48:00:00               # 제한 시간 (srun --time=4:00:00)
 #SBATCH --output=./logs/sbatch_log/slurm_%j.out  # 표준 출력 로그 저장 위치 (%j는 Job ID)
 #SBATCH --error=./logs/sbatch_log/slurm_%j.err   # 에러 로그 저장 위치
 #SBATCH --partition=debug               # (중요) 사용하는 파티션 이름이 있다면 주석 해제 후 수정 (예: gpu, batch 등)
@@ -41,6 +41,6 @@ echo "Start Time: $(date)"
 # --- Execution ---
 # 기존에 주신 sh 파일을 실행합니다.
 # 실행 권한이 없으면 미리 'chmod +x train_grpo_qwen2_5_vl_7b.sh'를 해주세요.
-bash train_grpo_qwen2_5_vl_7b.sh
+bash train_gspo_qwen2_5_vl_7b.sh
 
 echo "End Time: $(date)"

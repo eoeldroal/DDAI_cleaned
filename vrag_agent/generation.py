@@ -229,94 +229,295 @@ class LLMGenerationManager:
         responses = self._batch_tokenize(responses_str)
         return responses, responses_str
 
-    def _process_next_obs(self, next_obs: List, rollings) -> torch.Tensor:
-        """Process next observations from environment."""
-        next_obs_str = []
-        multi_modal_data = []
-        multi_modal_inputs = []
-        merge_length = self.processor.image_processor.merge_size**2
-        # print(self.retrievaled_images)
-        for idx, obs_item in enumerate(next_obs):
-            # invalid
-            if isinstance(obs_item,str):
-                next_obs_str.append(obs_item)
-                multi_modal_data.append({'image': []})
-                multi_modal_inputs.append(BatchFeature(dict()))
-            # invalid
-            elif isinstance(obs_item, list) and not isinstance(obs_item[0],dict) and len(self.retrievaled_images[idx]) == 0:
-                next_obs_str.append('\n<|im_start|>user\nYour previous action is invalid. You must conduct reasoning inside <think> and <think> every time you get new information. After reasoning, if you find you lack some knowledge, you can call a search engine using <search> query </search> and the user will return the search results. Whenever you retrieve an image, you may crop it for a clearer view using <bbox>[x1, y1, x2, y2]</bbox>. You can search as many times as you want. If you determine that no further knowledge is needed, you must finish with <search_complete>true</search_complete>. Otherwise, continue with <search> or <bbox> actions until you are ready to finish. Please try again.\n<|im_end|>\n<|im_start|>assistant\n')
-                multi_modal_data.append({'image': []})
-                multi_modal_inputs.append(BatchFeature(dict()))
-            # crop
-            elif isinstance(obs_item,list) and not isinstance(obs_item[0],dict):
-                try:
-                    latest_image = rollings.non_tensor_batch['multi_modal_data'][idx]['image'][-1]
-                    width, height = latest_image.size
-                    raw_images_crop = Image.open(self.retrievaled_images[idx][-1])
-                    raw_width, raw_height = raw_images_crop.size
-                    if self.is_validation:
-                        obs_item = [obs_item[0]-28, obs_item[1]-28, obs_item[2]+28, obs_item[3]+28]
-                    crop_area = [int(raw_width * obs_item[0] / width), int(raw_height * obs_item[1] / height), int(raw_width * obs_item[2] / width), int(raw_height * obs_item[3] / height)]
-                    crop_area = [max(0, crop_area[0]), max(0, crop_area[1]), min(raw_width, crop_area[2]), min(raw_height, crop_area[3])]
-                    input_images_list = [raw_images_crop.crop((crop_area[0], crop_area[1], crop_area[2], crop_area[3]))]
-                    raw_images_list = [process_image(image, 512*28*28, 256*28*28) for image in input_images_list]
+    # def _process_next_obs(self, next_obs: List, rollings) -> torch.Tensor:
+    #     """Process next observations from environment."""
+    #     next_obs_str = []
+    #     multi_modal_data = []
+    #     multi_modal_inputs = []
+    #     merge_length = self.processor.image_processor.merge_size**2
+    #     # print(self.retrievaled_images)
+    #     for idx, obs_item in enumerate(next_obs):
+    #         # invalid
+    #         if isinstance(obs_item,str):
+    #             next_obs_str.append(obs_item)
+    #             multi_modal_data.append({'image': []})
+    #             multi_modal_inputs.append(BatchFeature(dict()))
+    #         # invalid
+    #         elif isinstance(obs_item, list) and not isinstance(obs_item[0],dict) and len(self.retrievaled_images[idx]) == 0:
+    #             next_obs_str.append('\n<|im_start|>user\nYour previous action is invalid. You must conduct reasoning inside <think> and <think> every time you get new information. After reasoning, if you find you lack some knowledge, you can call a search engine using <search> query </search> and the user will return the search results. Whenever you retrieve an image, you may crop it for a clearer view using <bbox>[x1, y1, x2, y2]</bbox>. You can search as many times as you want. If you determine that no further knowledge is needed, you must finish with <search_complete>true</search_complete>. Otherwise, continue with <search> or <bbox> actions until you are ready to finish. Please try again.\n<|im_end|>\n<|im_start|>assistant\n')
+    #             multi_modal_data.append({'image': []})
+    #             multi_modal_inputs.append(BatchFeature(dict()))
+    #         # crop
+    #         elif isinstance(obs_item,list) and not isinstance(obs_item[0],dict):
+    #             try:
+    #                 latest_image = rollings.non_tensor_batch['multi_modal_data'][idx]['image'][-1]
+    #                 width, height = latest_image.size
+    #                 raw_images_crop = Image.open(self.retrievaled_images[idx][-1])
+    #                 raw_width, raw_height = raw_images_crop.size
+    #                 if self.is_validation:
+    #                     obs_item = [obs_item[0]-28, obs_item[1]-28, obs_item[2]+28, obs_item[3]+28]
+    #                 crop_area = [int(raw_width * obs_item[0] / width), int(raw_height * obs_item[1] / height), int(raw_width * obs_item[2] / width), int(raw_height * obs_item[3] / height)]
+    #                 crop_area = [max(0, crop_area[0]), max(0, crop_area[1]), min(raw_width, crop_area[2]), min(raw_height, crop_area[3])]
+    #                 input_images_list = [raw_images_crop.crop((crop_area[0], crop_area[1], crop_area[2], crop_area[3]))]
+    #                 raw_images_list = [process_image(image, 512*28*28, 256*28*28) for image in input_images_list]
 
-                    #generator added
-                    crop_path = os.path.join(self.config.crops_dir, f"{uuid.uuid4().hex}.jpg")
-                    raw_images_list[0].save(crop_path)
-                    self.cropped_images[idx].append(crop_path)
-                    #                    
+    #                 #generator added
+    #                 crop_path = os.path.join(self.config.crops_dir, f"{uuid.uuid4().hex}.jpg")
+    #                 raw_images_list[0].save(crop_path)
+    #                 self.cropped_images[idx].append(crop_path)
+    #                 #                    
 
-                    multi_modal_data.append({'image': raw_images_list})
-                    image_inputs = self.processor.image_processor(raw_images_list, return_tensors='pt') 
-                    multi_modal_inputs.append(image_inputs)
-                    image_grid_thw = image_inputs['image_grid_thw']
-                    obs_str = ''.join([f"<|vision_start|>{self.processor.image_token * (image_grid_thw_item.prod() // merge_length)}<|vision_end|>" for image_grid_thw_item in image_grid_thw])
-                    raw_obs_str = f"<|vision_start|>{self.processor.image_token}<|vision_end|>" * len(image_grid_thw) 
-                    obs_str = '\n<|im_start|>user\n' + obs_str + '<|im_end|>\n<|im_start|>assistant\n'
-                    next_obs_str.append(obs_str)   
-                except Exception as e:
-                    next_obs_str.append('\n<|im_start|>user\nYour previous action is invalid. You must conduct reasoning inside <think> and </think> every time you get new information. After reasoning, if you find you lack some knowledge, you can call a search engine using <search> query </search> and the user will return the search results. Whenever you retrieve an image, you may crop it for a clearer view using <bbox>[x1, y1, x2, y2]</bbox>. You can search as many times as you want. If you determine that no further external knowledge is needed, you must finish with <search_complete>true</search_complete>. Otherwise, continue with <search> or <bbox> actions until you are ready to finish. Please try again.\n<|im_end|>\n<|im_start|>assistant\n')
-                    multi_modal_data.append({'image': []})
-                    multi_modal_inputs.append(BatchFeature(dict())) 
-            # ret image
-            elif isinstance(obs_item,list) and isinstance(obs_item[0],dict):
+    #                 multi_modal_data.append({'image': raw_images_list})
+    #                 image_inputs = self.processor.image_processor(raw_images_list, return_tensors='pt') 
+    #                 multi_modal_inputs.append(image_inputs)
+    #                 image_grid_thw = image_inputs['image_grid_thw']
+    #                 obs_str = ''.join([f"<|vision_start|>{self.processor.image_token * (image_grid_thw_item.prod() // merge_length)}<|vision_end|>" for image_grid_thw_item in image_grid_thw])
+    #                 raw_obs_str = f"<|vision_start|>{self.processor.image_token}<|vision_end|>" * len(image_grid_thw) 
+    #                 obs_str = '\n<|im_start|>user\n' + obs_str + '<|im_end|>\n<|im_start|>assistant\n'
+    #                 next_obs_str.append(obs_str)   
+    #             except Exception as e:
+    #                 next_obs_str.append('\n<|im_start|>user\nYour previous action is invalid. You must conduct reasoning inside <think> and </think> every time you get new information. After reasoning, if you find you lack some knowledge, you can call a search engine using <search> query </search> and the user will return the search results. Whenever you retrieve an image, you may crop it for a clearer view using <bbox>[x1, y1, x2, y2]</bbox>. You can search as many times as you want. If you determine that no further external knowledge is needed, you must finish with <search_complete>true</search_complete>. Otherwise, continue with <search> or <bbox> actions until you are ready to finish. Please try again.\n<|im_end|>\n<|im_start|>assistant\n')
+    #                 multi_modal_data.append({'image': []})
+    #                 multi_modal_inputs.append(BatchFeature(dict())) 
+    #         # ret image
+    #         elif isinstance(obs_item,list) and isinstance(obs_item[0],dict):
 
-                img_file_list = [item['image_file'] for item in obs_item]
-                for image_item in img_file_list:
-                    if image_item not in self.retrievaled_images[idx]:
-                        self.retrievaled_images[idx].append(image_item)
-                        # input_images_list = img_file_list[:1]
-                        input_images_list = [image_item]
-                        break
+    #             img_file_list = [item['image_file'] for item in obs_item]
+    #             for image_item in img_file_list:
+    #                 if image_item not in self.retrievaled_images[idx]:
+    #                     self.retrievaled_images[idx].append(image_item)
+    #                     # input_images_list = img_file_list[:1]
+    #                     input_images_list = [image_item]
+    #                     break
+    #             #수정 pixe_value
+    #             # raw_images_list = [process_image(image, 512*28*28, 256*28*28) for image in input_images_list]
 
-                raw_images_list = [process_image(image, 512*28*28, 256*28*28) for image in input_images_list]
+    #             # multi_modal_data.append({'image': raw_images_list})
+    #             # image_inputs = self.processor.image_processor(raw_images_list, return_tensors='pt')
 
-                multi_modal_data.append({'image': raw_images_list})
-                image_inputs = self.processor.image_processor(raw_images_list, return_tensors='pt')
+    #             # multi_modal_inputs.append(image_inputs)
+    #             # image_grid_thw = image_inputs['image_grid_thw']
 
-                multi_modal_inputs.append(image_inputs)
-                image_grid_thw = image_inputs['image_grid_thw']
+    #             # obs_str = ''.join([f"<|vision_start|>{self.processor.image_token * (image_grid_thw_item.prod() // merge_length)}<|vision_end|>" for image_grid_thw_item in image_grid_thw])
+    #             # raw_obs_str = f"<|vision_start|>{self.processor.image_token}<|vision_end|>" * len(image_grid_thw) 
+    #             # obs_str = '\n<|im_start|>user\n' + obs_str + '<|im_end|>\n<|im_start|>assistant\n'
+    #             # next_obs_str.append(obs_str)
+    #             raw_images_list = [process_image(image, 512*28*28, 256*28*28) for image in input_images_list]
+    #             image_inputs = self.processor.image_processor(raw_images_list, return_tensors='pt')
 
-                obs_str = ''.join([f"<|vision_start|>{self.processor.image_token * (image_grid_thw_item.prod() // merge_length)}<|vision_end|>" for image_grid_thw_item in image_grid_thw])
-                raw_obs_str = f"<|vision_start|>{self.processor.image_token}<|vision_end|>" * len(image_grid_thw) 
-                obs_str = '\n<|im_start|>user\n' + obs_str + '<|im_end|>\n<|im_start|>assistant\n'
-                next_obs_str.append(obs_str)
-            else:
-                raise ValueError('invalid observation')
-        
-        next_obs_ids = self.tokenizer(
-            next_obs_str, 
-            padding='longest',
-            return_tensors='pt',
-            add_special_tokens=False,  # Prevents adding special tokens
-        )['input_ids']
-
-        return next_obs_ids, next_obs_str, multi_modal_data, multi_modal_inputs
+    #             if 'pixel_values' in image_inputs:
+    #                 # 정상인 경우: 기존 로직 수행
+    #                 multi_modal_data.append({'image': raw_images_list})
+    #                 multi_modal_inputs.append(image_inputs)
+                    
+    #                 image_grid_thw = image_inputs['image_grid_thw']
+    #                 obs_str = ''.join([f"<|vision_start|>{self.processor.image_token * (image_grid_thw_item.prod() // merge_length)}<|vision_end|>" for image_grid_thw_item in image_grid_thw])
+    #                 obs_str = '\n<|im_start|>user\n' + obs_str + '<|im_end|>\n<|im_start|>assistant\n'
+    #                 next_obs_str.append(obs_str)
+    #             else:
+    #                 # 실패한 경우: System Error 메시지 삽입 및 빈 데이터 추가
+    #                 print(f"Warning: Image processing failed for idx {idx}. Inserting Error Message.")
+    #                 multi_modal_data.append({'image': []})
+    #                 multi_modal_inputs.append(BatchFeature(dict()))
+                    
+    #                 error_msg = "\n<|im_start|>user\nSystem Error: Failed to load image due to format issues.\n<|im_end|>\n<|im_start|>assistant\n"
+    #                 next_obs_str.append(error_msg)
+    #             #//
+    #         else:
+    #             raise ValueError('invalid observation')
     
+    
+        # next_obs_ids = self.tokenizer(
+        #     next_obs_str, 
+        #     padding='longest',
+        #     return_tensors='pt',
+        #     add_special_tokens=False,  # Prevents adding special tokens
+        # )['input_ids']
+
+        # return next_obs_ids, next_obs_str, multi_modal_data, multi_modal_inputs
+    def _process_next_obs(self, next_obs: List, rollings) -> torch.Tensor:
+            """Process next observations from environment."""
+            next_obs_str = []
+            multi_modal_data = []
+            multi_modal_inputs = []
+            merge_length = self.processor.image_processor.merge_size**2
+            
+            for idx, obs_item in enumerate(next_obs):
+                # 1. Invalid String
+                if isinstance(obs_item,str):
+                    next_obs_str.append(obs_item)
+                    multi_modal_data.append({'image': []})
+                    multi_modal_inputs.append(BatchFeature(dict()))
+                
+                # 2. Invalid Action (No previous image)
+                elif isinstance(obs_item, list) and not isinstance(obs_item[0],dict) and len(self.retrievaled_images[idx]) == 0:
+                    next_obs_str.append('\n<|im_start|>user\nInvalid action: No image to crop. Please search first.\n<|im_end|>\n<|im_start|>assistant\n')
+                    multi_modal_data.append({'image': []})
+                    multi_modal_inputs.append(BatchFeature(dict()))
+                
+                # 3. [BBOX / CROP] 구간
+                elif isinstance(obs_item,list) and not isinstance(obs_item[0],dict):
+                    try:
+                        # 기존 로직 수행
+                        latest_image = rollings.non_tensor_batch['multi_modal_data'][idx]['image'][-1]
+                        width, height = latest_image.size
+                        raw_images_crop = Image.open(self.retrievaled_images[idx][-1])
+                        raw_width, raw_height = raw_images_crop.size
+                        
+                        if self.is_validation:
+                            obs_item = [obs_item[0]-28, obs_item[1]-28, obs_item[2]+28, obs_item[3]+28]
+                        crop_area = [int(raw_width * obs_item[0] / width), int(raw_height * obs_item[1] / height), int(raw_width * obs_item[2] / width), int(raw_height * obs_item[3] / height)]
+                        crop_area = [max(0, crop_area[0]), max(0, crop_area[1]), min(raw_width, crop_area[2]), min(raw_height, crop_area[3])]
+                        input_images_list = [raw_images_crop.crop((crop_area[0], crop_area[1], crop_area[2], crop_area[3]))]
+                        raw_images_list = [process_image(image, 512*28*28, 256*28*28) for image in input_images_list]
+
+                        # generator added
+                        crop_path = os.path.join(self.config.crops_dir, f"{uuid.uuid4().hex}.jpg")
+                        raw_images_list[0].save(crop_path)
+                        self.cropped_images[idx].append(crop_path)
+
+                        image_inputs = self.processor.image_processor(raw_images_list, return_tensors='pt') 
+                        
+                        # [검증] pixel_values 확인
+                        if 'pixel_values' in image_inputs:
+                            multi_modal_data.append({'image': raw_images_list})
+                            multi_modal_inputs.append(image_inputs)
+                            image_grid_thw = image_inputs['image_grid_thw']
+                            obs_str = ''.join([f"<|vision_start|>{self.processor.image_token * (image_grid_thw_item.prod() // merge_length)}<|vision_end|>" for image_grid_thw_item in image_grid_thw])
+                            raw_obs_str = f"<|vision_start|>{self.processor.image_token}<|vision_end|>" * len(image_grid_thw) 
+                            obs_str = '\n<|im_start|>user\n' + obs_str + '<|im_end|>\n<|im_start|>assistant\n'
+                            next_obs_str.append(obs_str)
+                        else:
+                            raise ValueError("BBox processing produced no pixel_values")
+
+                    except Exception as e:
+                        # [BBOX 실패 시 명확한 에러 메시지]
+                        print(f"[DEBUG] Bbox Error at idx {idx}: {e}")
+                        next_obs_str.append('\n<|im_start|>user\n[System Error: Bbox Crop Failed] The image crop operation failed. Please try a different action.\n<|im_end|>\n<|im_start|>assistant\n')
+                        multi_modal_data.append({'image': []})
+                        multi_modal_inputs.append(BatchFeature(dict())) 
+
+                # 4. [SEARCH / RETRIEVAL] 구간
+                elif isinstance(obs_item,list) and isinstance(obs_item[0],dict):
+
+                    img_file_list = [item['image_file'] for item in obs_item]
+                    for image_item in img_file_list:
+                        if image_item not in self.retrievaled_images[idx]:
+                            self.retrievaled_images[idx].append(image_item)
+                            input_images_list = [image_item]
+                            break
+                    
+                    try:
+                        raw_images_list = [process_image(image, 512*28*28, 256*28*28) for image in input_images_list]
+                        image_inputs = self.processor.image_processor(raw_images_list, return_tensors='pt')
+
+                        if 'pixel_values' in image_inputs:
+                            multi_modal_data.append({'image': raw_images_list})
+                            multi_modal_inputs.append(image_inputs)
+                            
+                            image_grid_thw = image_inputs['image_grid_thw']
+                            obs_str = ''.join([f"<|vision_start|>{self.processor.image_token * (image_grid_thw_item.prod() // merge_length)}<|vision_end|>" for image_grid_thw_item in image_grid_thw])
+                            obs_str = '\n<|im_start|>user\n' + obs_str + '<|im_end|>\n<|im_start|>assistant\n'
+                            next_obs_str.append(obs_str)
+                        else:
+                            # [SEARCH 실패 시 명확한 에러 메시지]
+                            print(f"[DEBUG] Search Image Error at idx {idx}: No pixel_values")
+                            error_msg = "\n<|im_start|>user\n[System Error: Search Image Failed] The retrieved image is corrupted or invalid.\n<|im_end|>\n<|im_start|>assistant\n"
+                            next_obs_str.append(error_msg)
+                            multi_modal_data.append({'image': []})
+                            multi_modal_inputs.append(BatchFeature(dict()))
+
+                    except Exception as e:
+                        print(f"[DEBUG] Search Processing Exception at idx {idx}: {e}")
+                        error_msg = "\n<|im_start|>user\n[System Error: Search Image Processing Exception]\n<|im_end|>\n<|im_start|>assistant\n"
+                        next_obs_str.append(error_msg)
+                        multi_modal_data.append({'image': []})
+                        multi_modal_inputs.append(BatchFeature(dict()))
+
+                else:
+                    raise ValueError('invalid observation')
+            
+            next_obs_ids = self.tokenizer(
+                next_obs_str, 
+                padding='longest',
+                return_tensors='pt',
+                add_special_tokens=False,
+            )['input_ids']
+
+            return next_obs_ids, next_obs_str, multi_modal_data, multi_modal_inputs
+#//
+
+    # def _concat_multi_modal_data(self, rollings, next_obs_multi_modal_data:list, next_obs_multi_modal_inputs:list):
+    #     if not 'multi_modal_inputs' in rollings.non_tensor_batch.keys():
+
+    #         rollings.non_tensor_batch['multi_modal_inputs'] = np.empty(len(next_obs_multi_modal_data), dtype=object)
+    #         for idx, item in enumerate(next_obs_multi_modal_inputs):
+    #             rollings.non_tensor_batch['multi_modal_inputs'][idx] = item
+
+    #         rollings.non_tensor_batch['multi_modal_data'] = np.array(next_obs_multi_modal_data, dtype=object)
+
+    #     else:
+    #         for idx, multi_modal_data_item in enumerate(next_obs_multi_modal_data):
+    #             if len(multi_modal_data_item['image']) > 0:
+    #                 # data
+    #                 #수정 pixel_value
+    #                 # rollings.non_tensor_batch['multi_modal_data'][idx]['image'].extend(multi_modal_data_item['image'])
+    #                 # if 'pixel_values' in rollings.non_tensor_batch['multi_modal_inputs'][idx]:
+    #                 #     rollings.non_tensor_batch['multi_modal_inputs'][idx]['pixel_values'] = torch.cat((rollings.non_tensor_batch['multi_modal_inputs'][idx]['pixel_values'], next_obs_multi_modal_inputs[idx]['pixel_values']),dim=0)
+    #                 #     rollings.non_tensor_batch['multi_modal_inputs'][idx]['image_grid_thw'] = torch.cat((rollings.non_tensor_batch['multi_modal_inputs'][idx]['image_grid_thw'], next_obs_multi_modal_inputs[idx]['image_grid_thw']),dim=0)
+    #                 # else:
+    #                 #     rollings.non_tensor_batch['multi_modal_inputs'][idx]['pixel_values'] = next_obs_multi_modal_inputs[idx]['pixel_values']
+    #                 #     rollings.non_tensor_batch['multi_modal_inputs'][idx]['image_grid_thw'] = next_obs_multi_modal_inputs[idx]['image_grid_thw']
+    #                 # ▼▼▼ [수정 핵심] 이미지가 있다고 해도, 실제 텐서 키(pixel_values)가 있는지 한 번 더 확인해야 함 ▼▼▼
+    #                 rollings.non_tensor_batch['multi_modal_data'][idx]['image'].extend(multi_modal_data_item['image'])
+                    
+    #                 # [핵심 수정] pixel_values가 있으면 정상 병합, 없으면 "더미 데이터" 생성하여 병합
+    #                 if 'pixel_values' in next_obs_multi_modal_inputs[idx]:
+    #                     # A. 정상 케이스
+    #                     if 'pixel_values' in rollings.non_tensor_batch['multi_modal_inputs'][idx]:
+    #                         rollings.non_tensor_batch['multi_modal_inputs'][idx]['pixel_values'] = torch.cat((rollings.non_tensor_batch['multi_modal_inputs'][idx]['pixel_values'], next_obs_multi_modal_inputs[idx]['pixel_values']),dim=0)
+    #                         rollings.non_tensor_batch['multi_modal_inputs'][idx]['image_grid_thw'] = torch.cat((rollings.non_tensor_batch['multi_modal_inputs'][idx]['image_grid_thw'], next_obs_multi_modal_inputs[idx]['image_grid_thw']),dim=0)
+    #                     else:
+    #                         rollings.non_tensor_batch['multi_modal_inputs'][idx]['pixel_values'] = next_obs_multi_modal_inputs[idx]['pixel_values']
+    #                         rollings.non_tensor_batch['multi_modal_inputs'][idx]['image_grid_thw'] = next_obs_multi_modal_inputs[idx]['image_grid_thw']
+                    
+    #                 else:
+    #                     # B. 비정상 케이스 (토큰은 있는데 픽셀값이 사라짐) -> 더미 데이터 주입하여 짝 맞춤
+    #                     print(f"Warning: 'pixel_values' missing at idx {idx} in _concat. Using Dummy Black Image to prevent IndexError.")
+                        
+    #                     # Qwen2-VL 기준 더미 데이터 생성 (1x1 픽셀)
+    #                     # pixel_values: 대략적인 shape과 타입만 맞추면 됨
+    #                     dummy_pixel_values = torch.zeros((1, 1176), dtype=torch.float32).to(rollings.batch['input_ids'].device) # 1176 is minimal flattened size roughly
+                        
+    #                     # image_grid_thw: [1, h, w] -> [1, 1, 1] (시간1, 높이1, 너비1)
+    #                     dummy_grid = torch.tensor([[1, 1, 1]], dtype=torch.long).to(rollings.batch['input_ids'].device)
+
+    #                     if 'pixel_values' in rollings.non_tensor_batch['multi_modal_inputs'][idx]:
+    #                         # 기존 텐서와 모양(Shape)을 맞춰서 병합 시도 (실패 시 안전하게 unsqueeze 등 처리)
+    #                         try:
+    #                             # 기존 pixel_values의 feature dimension(마지막 차원)을 확인하여 맞춤
+    #                             expected_dim = rollings.non_tensor_batch['multi_modal_inputs'][idx]['pixel_values'].shape[-1]
+    #                             if dummy_pixel_values.shape[-1] != expected_dim:
+    #                                  dummy_pixel_values = torch.zeros((1, expected_dim), dtype=torch.float32).to(rollings.batch['input_ids'].device)
+
+    #                             rollings.non_tensor_batch['multi_modal_inputs'][idx]['pixel_values'] = torch.cat((
+    #                                 rollings.non_tensor_batch['multi_modal_inputs'][idx]['pixel_values'], 
+    #                                 dummy_pixel_values
+    #                             ), dim=0)
+    #                             rollings.non_tensor_batch['multi_modal_inputs'][idx]['image_grid_thw'] = torch.cat((
+    #                                 rollings.non_tensor_batch['multi_modal_inputs'][idx]['image_grid_thw'], 
+    #                                 dummy_grid
+    #                             ), dim=0)
+    #                         except Exception as e:
+    #                             print(f"Error merging dummy tensor: {e}. Skipping (Crash risk high).")
+    #                     else:
+    #                         # 초기 할당
+    #                         rollings.non_tensor_batch['multi_modal_inputs'][idx]['pixel_values'] = dummy_pixel_values
+    #                         rollings.non_tensor_batch['multi_modal_inputs'][idx]['image_grid_thw'] = dummy_grid
+    #                 # ▲▲▲ [수정 끝] ▲▲▲
+    #     return rollings
     def _concat_multi_modal_data(self, rollings, next_obs_multi_modal_data:list, next_obs_multi_modal_inputs:list):
         if not 'multi_modal_inputs' in rollings.non_tensor_batch.keys():
-
             rollings.non_tensor_batch['multi_modal_inputs'] = np.empty(len(next_obs_multi_modal_data), dtype=object)
             for idx, item in enumerate(next_obs_multi_modal_inputs):
                 rollings.non_tensor_batch['multi_modal_inputs'][idx] = item
@@ -324,20 +525,26 @@ class LLMGenerationManager:
             rollings.non_tensor_batch['multi_modal_data'] = np.array(next_obs_multi_modal_data, dtype=object)
 
         else:
-
             for idx, multi_modal_data_item in enumerate(next_obs_multi_modal_data):
                 if len(multi_modal_data_item['image']) > 0:
-                    # data
-                    rollings.non_tensor_batch['multi_modal_data'][idx]['image'].extend(multi_modal_data_item['image'])
-                    if 'pixel_values' in rollings.non_tensor_batch['multi_modal_inputs'][idx]:
-                        rollings.non_tensor_batch['multi_modal_inputs'][idx]['pixel_values'] = torch.cat((rollings.non_tensor_batch['multi_modal_inputs'][idx]['pixel_values'], next_obs_multi_modal_inputs[idx]['pixel_values']),dim=0)
-                        rollings.non_tensor_batch['multi_modal_inputs'][idx]['image_grid_thw'] = torch.cat((rollings.non_tensor_batch['multi_modal_inputs'][idx]['image_grid_thw'], next_obs_multi_modal_inputs[idx]['image_grid_thw']),dim=0)
+                    
+                    # 방어 로직: pixel_values가 있을 때만 병합
+                    if 'pixel_values' in next_obs_multi_modal_inputs[idx]:
+                        rollings.non_tensor_batch['multi_modal_data'][idx]['image'].extend(multi_modal_data_item['image'])
+                        
+                        if 'pixel_values' in rollings.non_tensor_batch['multi_modal_inputs'][idx]:
+                            rollings.non_tensor_batch['multi_modal_inputs'][idx]['pixel_values'] = torch.cat((rollings.non_tensor_batch['multi_modal_inputs'][idx]['pixel_values'], next_obs_multi_modal_inputs[idx]['pixel_values']),dim=0)
+                            rollings.non_tensor_batch['multi_modal_inputs'][idx]['image_grid_thw'] = torch.cat((rollings.non_tensor_batch['multi_modal_inputs'][idx]['image_grid_thw'], next_obs_multi_modal_inputs[idx]['image_grid_thw']),dim=0)
+                        else:
+                            rollings.non_tensor_batch['multi_modal_inputs'][idx]['pixel_values'] = next_obs_multi_modal_inputs[idx]['pixel_values']
+                            rollings.non_tensor_batch['multi_modal_inputs'][idx]['image_grid_thw'] = next_obs_multi_modal_inputs[idx]['image_grid_thw']
                     else:
-                        rollings.non_tensor_batch['multi_modal_inputs'][idx]['pixel_values'] = next_obs_multi_modal_inputs[idx]['pixel_values']
-                        rollings.non_tensor_batch['multi_modal_inputs'][idx]['image_grid_thw'] = next_obs_multi_modal_inputs[idx]['image_grid_thw']
+                        # 텍스트에서 이미 이미지 토큰을 뺐으므로, 여기서는 그냥 넘어가도 안전합니다.
+                        # print(f"Skipping concatenation for idx {idx} (No pixel values)") 
+                        pass 
 
         return rollings
-        
+#//
 
     def _update_rolling_state(self, rollings, cur_responses: torch.Tensor, 
                             next_obs_ids: torch.Tensor) -> Dict:

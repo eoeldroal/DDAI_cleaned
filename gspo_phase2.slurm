@@ -1,13 +1,13 @@
 #!/bin/bash
 
 # --- Slurm Resource Configuration ---
-#SBATCH --job-name=vrag_grpo
+#SBATCH --job-name=vrag_gspo
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=480G
-#SBATCH --time=40:00:00
+#SBATCH --time=32:00:00
 #SBATCH --output=./logs/sbatch_log/slurm_%j.out
 #SBATCH --error=./logs/sbatch_log/slurm_%j.err
 #SBATCH --partition=debug
@@ -19,7 +19,7 @@ conda activate /home/isdslab/miniconda3/envs/LNS
 export PYTHONNOUSERSITE=1
 export PATH=/home/isdslab/miniconda3/envs/LNS/bin:$PATH
 export WANDB_API_KEY='8d955a8fe09693b7a2e983616a79aae912307d79'
-export WANDB_PROJECT='vrag_test'
+export WANDB_PROJECT='gspo_phase2'
 
 # Ray 정리
 ray stop
@@ -96,7 +96,7 @@ cd $TRAIN_DIR
 echo ">>> Starting Training Script..."
 # 이제 훈련 코드가 있는 폴더로 왔으니 스크립트 이름만 부르면 됩니다.
 # (만약 스크립트 파일이 다른 곳에 있다면 경로를 수정해주세요)
-bash train_grpo_qwen2_5_vl_7b.sh
+bash train_gspo_qwen2_5_vl_7b.sh
 
 
 # ==========================================

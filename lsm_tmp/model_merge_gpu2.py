@@ -27,14 +27,15 @@ def merge_grpo_checkpoint(base_path, output_path):
     model.to(dtype=torch.bfloat16)
 
     # 3. 가중치 수집 (이어붙이기 준비)
-    print("🧩 [3단계] 4개 GPU의 파라미터 조각을 수집합니다 (메모리 주의)...")
+    # [수정됨] 4개 -> 2개로 로그 메시지 변경
+    print("🧩 [3단계] 2개 GPU의 파라미터 조각을 수집합니다 (메모리 주의)...")
     
-    # 키별로 4개의 텐서 조각을 모을 리스트 딕셔너리
-    # 예: shards['lm_head.weight'] = [Tensor_Rank0, Tensor_Rank1, Tensor_Rank2, Tensor_Rank3]
     shards = defaultdict(list)
     
-    for rank in range(4):
-        checkpoint_name = f"model_world_size_4_rank_{rank}.pt"
+    # [수정됨] range(4) -> range(2)로 변경 (0, 1번만 반복)
+    for rank in range(2):
+        # [수정됨] 파일명 포맷 변경: world_size_4 -> world_size_2
+        checkpoint_name = f"model_world_size_2_rank_{rank}.pt"
         checkpoint_path = os.path.join(base_path, "actor", checkpoint_name)
         
         print(f"   ㄴ 📂 Rank {rank} 로드 중...")
@@ -54,7 +55,6 @@ def merge_grpo_checkpoint(base_path, output_path):
     full_state_dict = {}
     
     for key, tensor_list in shards.items():
-        # Rank 0, 1, 2, 3 순서대로 이미 리스트에 들어있음
         try:
             # 로그를 볼 때 모든 파라미터가 0번 차원(dim=0)으로 쪼개져 있음
             merged_tensor = torch.cat(tensor_list, dim=0)
@@ -66,7 +66,6 @@ def merge_grpo_checkpoint(base_path, output_path):
     # 5. 모델에 주입
     print("💉 [5단계] 완성된 가중치를 모델에 주입합니다...")
     
-    # 이제 크기가 맞으므로 에러가 없어야 함
     missing, unexpected = model.load_state_dict(full_state_dict, strict=False)
     
     if missing:
@@ -88,8 +87,8 @@ def merge_grpo_checkpoint(base_path, output_path):
     print(f"✅ 병합 완료! 확인해보세요: {output_path}")
 
 # --- 실행부 ---
-input_folder = "./checkpoints/vrag_test/my_run/global_step_50" 
-output_folder = "./merged_model_grpo"
+input_folder = "/data/daedong/gspo_phase1/gspo_phase1_last" 
+output_folder = "./RL_results/merged_gspo_phase1"
 
 if __name__ == "__main__":
     merge_grpo_checkpoint(input_folder, output_folder)

@@ -26,6 +26,7 @@ implement PPO
 """
 
 import numpy as np
+from typing import Optional #수정 gspo
 import torch
 from collections import defaultdict
 
@@ -308,6 +309,142 @@ def compute_policy_loss(old_log_prob, log_prob, advantages, eos_mask, cliprange)
     pg_loss = verl_F.masked_mean(torch.max(pg_losses, pg_losses2), eos_mask)
     pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses).float(), eos_mask)
     return pg_loss, pg_clipfrac, ppo_kl
+
+#수정 gspo
+def agg_loss(
+    loss_mat: torch.Tensor,
+    loss_mask: torch.Tensor,
+    loss_agg_mode: str,
+    dp_size: int = 1,
+    batch_num_tokens: Optional[int] = None,
+    global_batch_size: Optional[int] = None,
+    loss_scale_factor: Optional[int] = None,
+) -> torch.Tensor:
+    """
+    loss_mat, loss_mask를 받아서 다양한 방식으로 스칼라 loss로 집계하는 함수.
+
+    Args:
+        loss_mat: (B, T) 형태의 per-token loss matrix
+        loss_mask: (B, T) 형태의 mask (유효 토큰=1, padding=0)
+        loss_agg_mode: "token-mean", "seq-mean-token-sum",
+                       "seq-mean-token-mean", "seq-mean-token-sum-norm"
+        dp_size: 데이터 병렬 world size
+        batch_num_tokens: DP 전체에서 유효 토큰 수
+        global_batch_size: DP 전체에서 유효 sequence 수
+        loss_scale_factor: seq-mean-token-sum-norm에서 정규화에 사용
+    """
+
+    if loss_agg_mode == "token-mean":
+        # 모든 토큰 기준 평균 (DP 전체 토큰 수로 나눔)
+        if batch_num_tokens is None:
+            batch_num_tokens = loss_mask.sum()
+        loss = verl_F.masked_sum(loss_mat, loss_mask) / batch_num_tokens * dp_size
+
+    elif loss_agg_mode == "seq-mean-token-sum":
+        # 1) 토큰 합으로 seq loss 만들고
+        # 2) non-empty seq만 골라서 seq 평균
+        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)  # token-sum per seq
+        seq_mask = (torch.sum(loss_mask, dim=-1) > 0).float()  # non-empty seq indicator
+        if global_batch_size is None:
+            global_batch_size = seq_mask.sum()
+        loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size
+
+    elif loss_agg_mode == "seq-mean-token-mean":
+        # 1) 각 seq별 토큰 평균 loss 만들고
+        # 2) non-empty seq만 골라서 seq 평균
+        seq_token_counts = torch.sum(loss_mask, dim=-1)  # per-sequence token count
+        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / (seq_token_counts + 1e-8)
+        seq_mask = (seq_token_counts > 0).float()  # non-empty seq indicator
+        if global_batch_size is None:
+            global_batch_size = seq_mask.sum()
+        loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size
+
+    elif loss_agg_mode == "seq-mean-token-sum-norm":
+        # 토큰 합을 구한 뒤, 주어진 스케일로 나눠 정규화
+        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)
+        if loss_scale_factor is None:
+            loss_scale_factor = loss_mask.shape[-1]
+        loss = torch.sum(seq_losses) / loss_scale_factor
+
+    else:
+        raise ValueError(f"Unknown loss_agg_mode: {loss_agg_mode}")
+
+    return loss
+
+#gspo 수정
+def compute_policy_loss_gspo(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    eos_mask: torch.Tensor,
+    clip_ratio_low: float,
+    clip_ratio_high: float,
+    global_batch_info: Optional[dict] = None,
+):
+    """
+    GSPO-style clipped policy loss (sequence-level importance ratio + seq-mean-token-mean agg).
+
+    Args:
+        old_log_prob: (B, T)
+        log_prob: (B, T)
+        advantages: (B, T)
+        eos_mask: (B, T), response 영역=1
+        clip_ratio_low, clip_ratio_high: GSPO 클리핑 범위
+        global_batch_info: {"dp_size", "batch_num_tokens", "global_batch_size"} 등이 들어갈 예정
+    """
+
+    # 1) token-level log-ratio
+    negative_approx_kl = log_prob - old_log_prob  # (B, T)
+
+    # 2) sequence-level 평균 log-ratio (log π_new - log π_old), response 토큰만
+    seq_lengths = torch.sum(eos_mask, dim=-1).clamp(min=1)  # (B,)
+    negative_approx_kl_seq = torch.sum(negative_approx_kl * eos_mask, dim=-1) / seq_lengths  # (B,)
+
+    # 3) sequence-level ratio를 token에 입힌 형태 (gradient는 token log_prob에서만 나옴)
+    log_seq_importance_ratio = (
+        log_prob - log_prob.detach()
+        + negative_approx_kl_seq.detach().unsqueeze(-1)
+    )
+    log_seq_importance_ratio = torch.clamp(log_seq_importance_ratio, max=10.0)
+    seq_importance_ratio = torch.exp(log_seq_importance_ratio)  # (B, T)
+
+    # 4) PPO-style 클리핑
+    pg_losses1 = -advantages * seq_importance_ratio
+    pg_losses2 = -advantages * torch.clamp(
+        seq_importance_ratio,
+        1.0 - clip_ratio_low,
+        1.0 + clip_ratio_high,
+    )
+    pg_losses = torch.maximum(pg_losses1, pg_losses2)  # (B, T)
+
+    # 5) seq-mean-token-mean aggregation (agg_loss 사용)
+    if global_batch_info is None:
+        dp_size = 1
+        batch_num_tokens = None
+        global_batch_size = None
+    else:
+        dp_size = global_batch_info.get("dp_size", 1)
+        batch_num_tokens = global_batch_info.get("batch_num_tokens", None)
+        global_batch_size = global_batch_info.get("global_batch_size", None)
+
+    pg_loss = agg_loss(
+        loss_mat=pg_losses,
+        loss_mask=eos_mask,
+        loss_agg_mode="seq-mean-token-mean",
+        dp_size=dp_size,
+        batch_num_tokens=batch_num_tokens,
+        global_batch_size=global_batch_size,
+    )
+
+    # 6) metric용 값들 (기존과 동일)
+    pg_clipfrac = verl_F.masked_mean(
+        (pg_losses2 > pg_losses).float(), eos_mask
+    )
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, eos_mask)
+
+    return pg_loss, pg_clipfrac, ppo_kl
+
+#//
 
 
 def compute_entropy_loss(logits, eos_mask):

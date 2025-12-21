@@ -917,9 +917,14 @@ class RayPPOTrainer(object):
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
 
-                        # we combine with rule-based rm
-                        reward_tensor = self.reward_fn(batch)   #설명:생성된 답변 점수를 미기기 위해 호출 
+                        # 수정 wandb 로깅
+                        # reward_tensor = self.reward_fn(batch)   #설명:생성된 답변 점수를 미기기 위해 호출 
+                        # batch.batch['token_level_scores'] = reward_tensor
+
+                        # [수정 후] 
+                        reward_tensor, reward_metrics = self.reward_fn(batch)
                         batch.batch['token_level_scores'] = reward_tensor
+                        metrics.update(reward_metrics)
 
                         # compute rewards. apply_kl_penalty if available
                         if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):

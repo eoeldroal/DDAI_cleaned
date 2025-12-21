@@ -19,6 +19,10 @@ Single Process Actor
 import itertools
 from typing import Iterable, Tuple
 
+#gspo 수정 추가
+import torch.distributed as dist 
+
+
 import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -284,17 +288,84 @@ class DataParallelPPOActor(BasePPOActor):
                     old_log_prob = data['old_log_probs']
                     advantages = data['advantages']
 
+                    # ===== GSPO / agg_loss용 global_batch_info 계산 =====
+                    if dist.is_available() and dist.is_initialized():
+                        dp_size = dist.get_world_size()
+                    else:
+                        dp_size = 1
+
+                    # 이 rank에서 보는 시퀀스 개수
+                    local_batch_size = response_mask.size(0)
+
+                    # 이 rank에서의 response 토큰 수 합
+                    local_batch_num_tokens = response_mask.to(torch.float32).sum()
+
+                    batch_num_tokens = local_batch_num_tokens.clone()
+                    global_batch_size = torch.tensor(
+                        float(local_batch_size),
+                        device=response_mask.device,
+                        dtype=torch.float32,
+                    )
+
+                    # DP 전체 기준으로 합산
+                    if dp_size > 1:
+                        dist.all_reduce(batch_num_tokens, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(global_batch_size, op=dist.ReduceOp.SUM)
+
+                    global_batch_info = {
+                        "dp_size": dp_size,
+                        "batch_num_tokens": batch_num_tokens,
+                        "global_batch_size": global_batch_size,
+                    }
+
+                    # ===============================================                    
+
+
                     clip_ratio = self.config.clip_ratio
+                    #수정 gspo
+                    clip_ratio_low = getattr(self.config, "clip_ratio_low", None) or clip_ratio
+                    clip_ratio_high = getattr(self.config, "clip_ratio_high", None) or clip_ratio
+                    #//
                     entropy_coeff = self.config.entropy_coeff
 
                     # all return: (bsz, response_length)
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
 
-                    pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
-                                                                                log_prob=log_prob,
-                                                                                advantages=advantages,
-                                                                                eos_mask=response_mask,
-                                                                                cliprange=clip_ratio)
+                    #수정 gspo
+                    # pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
+                    #                                                             log_prob=log_prob,
+                    #                                                             advantages=advantages,
+                    #                                                             eos_mask=response_mask,
+                    #                                                             cliprange=clip_ratio)
+                    # mode 읽기 (기본은 vanilla)
+                    policy_loss_mode = getattr(self.config, "policy_loss_mode", "vanilla")
+
+                    if policy_loss_mode == "gspo":
+                        # GSPO policy loss
+                        global_batch_info = getattr(self.config, "global_batch_info", None)
+
+                        pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss_gspo(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            eos_mask=response_mask,
+                            clip_ratio_low=clip_ratio_low,
+                            clip_ratio_high=clip_ratio_high,
+                            global_batch_info=global_batch_info,  # 👈 여기만 있으면 됨
+                        )
+                    else:
+                        # 기존 vanilla PPO
+                        pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            eos_mask=response_mask,
+                            cliprange=clip_ratio,
+                        )
+
+
+                    #//
+
                     # compute entropy loss from entropy
                     entropy_loss = verl_F.masked_mean(entropy, response_mask)
 

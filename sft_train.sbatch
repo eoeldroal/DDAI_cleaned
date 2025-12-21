@@ -10,15 +10,18 @@
 #SBATCH -o logs/sft_output_%j.log
 
 source /home/isdslab/miniconda3/etc/profile.d/conda.sh
-conda activate /home/isdslab/miniconda3/envs/vrag_test
+conda activate /home/isdslab/miniconda3/envs/LNS
 
 export PYTHONNOUSERSITE=1
 export PATH=/home/isdslab/miniconda3/envs/vrag_test/bin:$PATH
 
+export WANDB_API_KEY='8d955a8fe09693b7a2e983616a79aae912307d79'
+export WANDB_PROJECT='vrag_sft'      
+
 
 torchrun --nproc_per_node=$SLURM_GPUS_PER_NODE -m verl.trainer.fsdp_sft_trainer \
-    data.train_files=lsm_tmp/results/sft_dataset/filtered_train_fin_500.parquet \
-    data.val_files=lsm_tmp/results/sft_dataset/filtered_val_fin_500.parquet \
+    data.train_files=lsm_tmp/results/sft_dataset/train1.parquet \
+    data.val_files=lsm_tmp/results/sft_dataset/val1.parquet \
     model.partial_pretrain=Qwen/Qwen2.5-VL-7B-Instruct \
     trainer.default_local_dir=outputs/sft-test-filtered_test \
     model.enable_gradient_checkpointing=true \
