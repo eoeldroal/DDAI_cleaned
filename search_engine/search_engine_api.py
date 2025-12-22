@@ -45,5 +45,30 @@ async def search(queries: List[str] = Query(...)):
     results_batch = [[dict(idx=idx,image_file=os.path.join(f'./search_engine/corpus/img',file)) for idx,file in enumerate(query_results)] for query_results in results_batch]
     return results_batch
 
+
+# =========================================================================
+# [NEW] 캐시 관리 엔드포인트
+# =========================================================================
+@app.get(
+    "/cache/stats",
+    summary="Get cache statistics",
+    description="Returns cache hit rate, size, and other statistics.",
+)
+async def cache_stats():
+    """캐시 통계 조회"""
+    return search_engine.get_cache_stats()
+
+
+@app.post(
+    "/cache/clear",
+    summary="Clear cache",
+    description="Clears the query result cache.",
+)
+async def cache_clear():
+    """캐시 초기화"""
+    search_engine.clear_cache()
+    return {"status": "success", "message": "Cache cleared"}
+
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8002)

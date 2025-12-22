@@ -152,7 +152,7 @@ FORCED_COMPLETION_RESPONSE = "<think>Maximum turn limit reached. Trigger search_
 @dataclass
 class GenerationConfig:
     max_turns: int
-    max_prompt_length: int 
+    max_prompt_length: int
     num_gpus: int
     search_url: str = None
     #generator added
@@ -164,6 +164,10 @@ class GenerationConfig:
     generator_batch_workers: int = 4
     frozen_max_retries: int = 3
     frozen_backoff_base: float = 1.5
+    # [NEW] 검색 최적화 옵션
+    async_search: bool = True                # 비동기 병렬 검색 활성화
+    search_batch_size: int = 100             # 검색 요청 배치 크기
+    search_max_workers: int = 4              # 병렬 검색 워커 수
     
 
 
@@ -174,6 +178,7 @@ class LLMGenerationManager:
         actor_rollout_wg,
         config: GenerationConfig,
         is_validation: bool = False,
+        streaming_reward_manager=None,  # [NEW] 스트리밍 Reward Manager
     ):
         self.processor = processor
         self.tokenizer = processor.tokenizer
@@ -189,6 +194,10 @@ class LLMGenerationManager:
         os.makedirs("./logs", exist_ok=True)
         self.cropped_images = None
         self.questions = None
+
+        # [NEW] 스트리밍 Reward Manager
+        self.streaming_reward_manager = streaming_reward_manager
+        self._prompt_completion_status: Dict[str, Dict] = {}
                 
 
 
@@ -707,6 +716,10 @@ class LLMGenerationManager:
 
         meta_info = {}
 
+        # [NEW] 스트리밍 모드 초기화
+        if self.streaming_reward_manager:
+            self._init_prompt_tracking(gen_batch)
+
         # ▼▼▼[성능 측정 추가] 1. 로그 파일 및 모니터 객체 초기화▼▼▼ 수정
         # 고유한 로그 파일 이름을 생성하여 모든 측정 결과를 한 파일에 기록합니다.
         current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1038,9 +1051,91 @@ class LLMGenerationManager:
         
         return final_output
 
-# ... (generation.py 파일의 다른 부분은 모두 동일합니다) ...
+    # =========================================================================
+    # [NEW] 비동기 병렬 검색 메서드
+    # =========================================================================
+    def _search_single_batch(self, batch_reqs: List[Dict], max_retries: int = 3) -> List[Dict]:
+        """
+        단일 배치 검색 요청 (워커 스레드에서 실행)
+        실패 시 지수 백오프로 재시도
+        """
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(
+                    self.config.search_url,
+                    json=batch_reqs,
+                    timeout=5
+                )
+                response.raise_for_status()
+                return response.json()
+            except Exception as e:
+                last_error = e
+                wait_time = (2 ** attempt) + _random.uniform(0, 1)
+                print(f"[Search] 배치 검색 오류 (시도 {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    _time.sleep(wait_time)
 
-    # execute_predictions 함수를 아래와 같이 수정합니다.
+        # 모든 재시도 실패 시 예외 발생
+        raise RuntimeError(f"검색 배치 {max_retries}회 재시도 실패: {last_error}")
+
+    def _async_search_batches(self, search_requests: List[Dict]) -> Dict[int, List]:
+        """
+        비동기 병렬 검색 - ThreadPoolExecutor로 배치들을 병렬 처리
+
+        Args:
+            search_requests: 검색 요청 리스트 [{query, id, request_idx}, ...]
+
+        Returns:
+            request_idx -> results 매핑
+
+        Raises:
+            RuntimeError: 검색 실패 시 (재시도 후에도 실패)
+        """
+        if not search_requests:
+            return {}
+
+        batch_size = self.config.search_batch_size
+        max_workers = self.config.search_max_workers
+
+        # 배치로 분할
+        batches = [
+            search_requests[i:i + batch_size]
+            for i in range(0, len(search_requests), batch_size)
+        ]
+
+        all_results = []
+        errors = []
+
+        # 병렬 실행
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(self._search_single_batch, batch): idx
+                for idx, batch in enumerate(batches)
+            }
+
+            for future in as_completed(futures):
+                batch_idx = futures[future]
+                try:
+                    batch_results = future.result()
+                    all_results.extend(batch_results)
+                except Exception as e:
+                    errors.append((batch_idx, str(e)))
+
+        # 오류가 있으면 예외 발생
+        if errors:
+            error_msg = "; ".join([f"배치{idx}: {err}" for idx, err in errors])
+            raise RuntimeError(f"병렬 검색 실패: {error_msg}")
+
+        # 결과 매핑 생성
+        results_map = {
+            item['request_idx']: item.get('results', [])
+            for item in all_results
+        }
+
+        return results_map
+
+    # execute_predictions 함수
     def execute_predictions(self, predictions: List[str], uids: np.ndarray, pad_token: str, active_mask=None, do_search=True) -> List[str]:
         cur_actions, contents = self.postprocess_predictions(predictions)  
 
@@ -1061,18 +1156,25 @@ class LLMGenerationManager:
                 })                   
 
         if do_search:
-            if len(search_requests) > 0:              
-                batch_size = 100
-                search_results_list = []
-                for i in range(0, len(search_requests), batch_size):
-                    batch_reqs = search_requests[i:i + batch_size]
+            if len(search_requests) > 0:
+                # [MODIFIED] 비동기/동기 검색 분기
+                if getattr(self.config, 'async_search', True):
+                    # 비동기 병렬 검색 (기본값)
+                    results_map = self._async_search_batches(search_requests)
+                else:
+                    # 기존 순차 검색 (fallback)
+                    batch_size = getattr(self.config, 'search_batch_size', 100)
+                    search_results_list = []
+                    for i in range(0, len(search_requests), batch_size):
+                        batch_reqs = search_requests[i:i + batch_size]
+                        response = requests.post(self.config.search_url, json=batch_reqs)
+                        search_results_single_batch = response.json()
+                        search_results_list.extend(search_results_single_batch)
 
-                    response = requests.post(self.config.search_url, json=batch_reqs)                    
-                    search_results_single_batch = response.json()
-                    search_results_list.extend(search_results_single_batch)                  
+                    results_map = {item['request_idx']: item.get('results', []) for item in search_results_list}
 
-                results_map = {item['request_idx']: item.get('results', []) for item in search_results_list}
-                assert len(results_map) == len(search_requests)
+                assert len(results_map) == len(search_requests), \
+                    f"검색 결과 수 불일치: {len(results_map)} != {len(search_requests)}"
             else:
                 results_map = {}
         else:
@@ -1102,6 +1204,11 @@ class LLMGenerationManager:
                     is_true = contents[i].strip().lower() == 'true'
                     if is_true:
                         self.search_completed[i] = True
+
+                        # [NEW] 스트리밍 Reward: 프롬프트 완료 체크
+                        if self.streaming_reward_manager:
+                            self._check_and_submit_prompt_reward(i)
+
                     next_obs.append('')
                     dones.append(1)  # trajectory 종료
                 else:
@@ -1284,8 +1391,119 @@ class LLMGenerationManager:
                         results[i] = ans or ""
 
             _time.sleep(0.05)
-        
-        return results 
+
+        return results
+
+    # =========================================================================
+    # 스트리밍 Reward 관련 메서드들
+    # =========================================================================
+    def _init_prompt_tracking(self, gen_batch):
+        """
+        프롬프트별 완료 추적 초기화
+
+        n_agent 구조에서 각 프롬프트의 샘플들을 그룹화하여 추적합니다.
+        프롬프트의 모든 샘플이 완료되면 Reward 계산을 시작합니다.
+        """
+        uids = gen_batch.non_tensor_batch.get('uid', gen_batch.non_tensor_batch.get('id', []))
+        n_agent = getattr(self.config, 'n_agent', 8)  # 기본값 8
+
+        batch_size = len(uids)
+        num_prompts = batch_size // n_agent
+
+        self._prompt_completion_status.clear()
+
+        for prompt_idx in range(num_prompts):
+            base_idx = prompt_idx * n_agent
+            # uid에서 고유 프롬프트 ID 추출 (n_agent 샘플들은 같은 베이스 uid를 공유)
+            uid = str(uids[base_idx])
+            # uid에서 마지막 숫자 부분 제거하여 프롬프트 ID 생성
+            prompt_id = uid.rsplit('_', 1)[0] if '_' in uid else uid
+
+            self._prompt_completion_status[prompt_id] = {
+                'total_samples': n_agent,
+                'completed_samples': 0,
+                'sample_indices': list(range(base_idx, base_idx + n_agent)),
+                'submitted': False
+            }
+
+        print(f"[Generation] 스트리밍 추적 초기화: {num_prompts}개 프롬프트, "
+              f"각 {n_agent}개 샘플")
+
+    def _check_and_submit_prompt_reward(self, sample_idx: int):
+        """
+        샘플 완료 시 프롬프트 전체 완료 여부 확인 후 Reward 제출
+
+        Args:
+            sample_idx: 완료된 샘플의 배치 내 인덱스
+        """
+        n_agent = getattr(self.config, 'n_agent', 8)
+        prompt_idx = sample_idx // n_agent
+
+        # 프롬프트 ID 찾기
+        prompt_ids = list(self._prompt_completion_status.keys())
+        if prompt_idx >= len(prompt_ids):
+            return
+
+        prompt_id = prompt_ids[prompt_idx]
+        status = self._prompt_completion_status.get(prompt_id)
+        if not status or status['submitted']:
+            return
+
+        status['completed_samples'] += 1
+
+        # 프롬프트의 모든 샘플이 완료되었는지 확인
+        if status['completed_samples'] >= status['total_samples']:
+            samples_data = self._collect_samples_data(status['sample_indices'])
+
+            self.streaming_reward_manager.submit_prompt(
+                uid=prompt_id,
+                sample_indices=status['sample_indices'],
+                samples_data=samples_data
+            )
+            status['submitted'] = True
+            print(f"[Generation] 프롬프트 {prompt_id} Reward 제출 "
+                  f"(샘플 {len(status['sample_indices'])}개)")
+
+    def _collect_samples_data(self, indices: List[int]) -> List[Dict]:
+        """
+        Reward 계산에 필요한 샘플 데이터 수집
+
+        스트리밍 모드에서 RMManager에 전달할 데이터를 수집합니다.
+        현재는 롤아웃 데이터에 접근할 수 없으므로 기본 정보만 수집합니다.
+
+        Args:
+            indices: 수집할 샘플 인덱스 리스트
+
+        Returns:
+            각 샘플의 전처리된 데이터 리스트
+        """
+        samples_data = []
+
+        for idx in indices:
+            # 검색된 이미지 경로
+            retrieved_images = list(self.retrievaled_images[idx]) if idx < len(self.retrievaled_images) else []
+
+            # NDCG 계산용 basename 추출
+            retrieved_basenames = [
+                os.path.basename(p.rstrip('/')).split(".jpg")[0]
+                for p in retrieved_images
+            ]
+
+            # 질문 추출
+            question = self.questions[idx] if idx < len(self.questions) else ''
+
+            samples_data.append({
+                'query': question,
+                'retrieved_images': retrieved_images,
+                'retrieved_basenames': retrieved_basenames,
+                # 아래 필드들은 나중에 ray_trainer.py에서 채워질 예정
+                'response_str': '',
+                'reference_answer': '',
+                'reference_image_paths': [],
+                'reference_basenames': [],
+            })
+
+        return samples_data
 
 
 
