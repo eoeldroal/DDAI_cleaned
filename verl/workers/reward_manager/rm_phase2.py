@@ -1,392 +1,1113 @@
-# Copyright 2024 Bytedance Ltd. and/or its affiliates
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+"""
+rm_phase2.py - Gemini 3 Flash 기반 VLM as Judge Reward Manager
 
+=============================================================================
+개요
+=============================================================================
+이 모듈은 GSPO Phase 2 학습을 위한 Reward Manager입니다.
+Gemini 3 Flash VLM을 Judge로 사용하여 모델의 추론 과정 전체를 평가합니다.
+
+기존 구현(rm_phase2_deprecated.py)과의 차이점:
+1. FastAPI 서버 대신 Gemini SDK 직접 호출 (오버헤드 감소)
+2. 최종 답변만이 아닌 추론 과정 전체 평가 (think, search, bbox, answer)
+3. 검색된 이미지 + 정답 이미지 모두를 VLM에 전달
+4. 최적화된 단일 루프 구조 (중복 디코딩 제거)
+5. JSONL 로그 형식 (append 모드로 I/O 효율화)
+6. 비동기 배치 처리 (asyncio + generate_content_async)로 ~9배 성능 향상
+
+=============================================================================
+점수 계산 공식
+=============================================================================
+final_score = 0.8 * vlm_score + 0.2 * ndcg_value
+
+- vlm_score: Gemini VLM Judge가 평가한 점수 (0.0 ~ 1.0)
+  - visual_claims_score: 이미지 내용과 추론의 일치도
+  - think_answer_consistency: <think>와 <answer>의 일관성
+  - search_efficiency: 검색 쿼리의 효율성
+  - answer_accuracy: 정답과의 일치도
+
+- ndcg_value: 검색된 이미지와 정답 이미지의 NDCG (0.0 ~ 1.0)
+
+=============================================================================
+입/출력 인터페이스
+=============================================================================
+입력: DataProto
+  - batch['prompts']: (batch_size, prompt_length)
+  - batch['responses']: (batch_size, response_length)
+  - batch['attention_mask']: (batch_size, total_length)
+  - non_tensor_batch['extra_info']: dict
+  - non_tensor_batch['reward_model']['ground_truth']: str
+  - non_tensor_batch['retrievaled_images']: list
+
+출력: (reward_tensor, metrics)
+  - reward_tensor: (batch_size, response_length) - 마지막 토큰에만 점수 할당
+  - metrics: dict - wandb 로깅용 평균 메트릭
+
+=============================================================================
+환경 설정
+=============================================================================
+필수 환경 변수:
+  export GEMINI_API_KEY="your-api-key"
+
+필수 패키지:
+  pip install google-generativeai pillow
+"""
+
+# =============================================================================
+# Imports
+# =============================================================================
 from verl import DataProto
-#from verl.utils.reward_score import _default_compute_score #수정 phase2
 import torch
 import json
-import requests
-import math
 import numpy as np
 import os
-import re #added
+import asyncio
+import threading
+import queue
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+from PIL import Image
+
+# Gemini SDK
+import google.generativeai as genai
+
+
+# =============================================================================
+# VLM Judge 프롬프트
+# =============================================================================
+# 이 프롬프트는 Gemini VLM에게 전달되어 모델의 추론 과정을 평가합니다.
+#
+# 평가 기준 (우선순위 순):
+#   1. Answer Accuracy: 정답과의 일치도 (가장 중요)
+#   2. Visual Grounding: 이미지 내용과 추론의 일치 여부
+#   3. Reasoning Consistency: 추론과 답변의 논리적 일관성
+#
+# 참고: Search Efficiency는 NDCG로 별도 계산되므로 VLM 평가에서 제외
+
+VLM_JUDGE_PROMPT = """You are an expert evaluator for a visual question answering agent.
+Evaluate the agent's response based on the provided images and reference answer.
+
+## Input
+- Images: {image_description}
+- Query: {query}
+- Agent's Response:
+{full_response}
+- Reference Answer: {reference_answer}
+
+## Evaluation Criteria (in order of importance)
+
+### 1. Answer Accuracy (Most Important)
+Does the final answer correctly address the query?
+- Compare with the reference answer
+- Consider semantic equivalence, not just exact match
+- Partial credit for partially correct answers
+
+### 2. Visual Grounding
+Are the claims in the response supported by the actual image content?
+- Check if visual descriptions match what's in the images
+- Penalize fabricated or hallucinated details
+
+### 3. Reasoning Consistency
+Is the reasoning process logically coherent?
+- Does the conclusion follow from the observations?
+- Are there any contradictions in the reasoning?
+
+## Scoring Guidelines
+- Prioritize answer correctness above all else
+- A correct answer with minor reasoning flaws should score higher than incorrect answer with good reasoning
+- Give partial credit when appropriate
+"""
+
+# =============================================================================
+# VLM Judge 응답 스키마 (Gemini Structured Output)
+# =============================================================================
+# Gemini SDK의 response_schema 기능을 사용하여 JSON 응답을 강제합니다.
+# 참고: https://ai.google.dev/gemini-api/docs/structured-output
+
+VLM_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "answer_accuracy": {
+            "type": "number",
+            "description": "How well the answer matches the reference (0.0-1.0)"
+        },
+        "visual_grounding": {
+            "type": "number",
+            "description": "How well claims are supported by image content (0.0-1.0)"
+        },
+        "reasoning_consistency": {
+            "type": "number",
+            "description": "Logical coherence of the reasoning process (0.0-1.0)"
+        },
+        "final_score": {
+            "type": "number",
+            "description": "Overall score considering all criteria (0.0-1.0)"
+        }
+    },
+    "required": ["answer_accuracy", "visual_grounding", "reasoning_consistency", "final_score"]
+}
+
+
+# =============================================================================
+# 헬퍼 함수: NDCG 계산
+# =============================================================================
 def dcg(relevance_scores):
     """
-    计算折扣累积增益（DCG）
-    :param relevance_scores: 一个列表，表示每个文档的相关性分数
-    :return: DCG 值
+    DCG (Discounted Cumulative Gain) 계산
+
+    검색 결과의 품질을 측정하는 지표입니다.
+    순위가 높을수록 (앞에 있을수록) 더 높은 가중치를 부여합니다.
+
+    Args:
+        relevance_scores: 각 문서의 관련성 점수 리스트 [1, 0, 1, 0, ...]
+
+    Returns:
+        DCG 값 (float)
     """
     dcg_value = 0.0
     for i, relevance in enumerate(relevance_scores, start=1):
+        # log2(i+1)로 나누어 순위가 낮을수록 할인(discount) 적용
         dcg_value += (2 ** relevance - 1) / np.log2(i + 1)
     return dcg_value
 
+
 def ndcg(sorted_docs, golden_answer_list):
     """
-    计算归一化折扣累积增益（NDCG）
-    :param sorted_docs: 一个列表，表示已经排好序的文档
-    :param golden_answer_list: 一个列表，表示所有相关文档（golden answers）
-    :return: NDCG 值
+    NDCG (Normalized Discounted Cumulative Gain) 계산
+
+    DCG를 이상적인 DCG(IDCG)로 정규화하여 0~1 사이 값으로 변환합니다.
+    1에 가까울수록 검색 품질이 좋음을 의미합니다.
+
+    Args:
+        sorted_docs: 검색된 문서 리스트 (basename)
+        golden_answer_list: 정답 문서 리스트 (basename)
+
+    Returns:
+        NDCG 값 (0.0 ~ 1.0)
     """
-    # 将文档映射为相关性分数（在 golden_answer_list 中的文档为 1，否则为 0）
+    # 각 문서가 정답에 포함되면 1, 아니면 0
     relevance_scores = [1 if doc in golden_answer_list else 0 for doc in sorted_docs]
-    
-    # 计算 DCG
+
+    # 실제 DCG 계산
     dcg_value = dcg(relevance_scores)
-    
-    # 计算 IDCG（理想情况下的 DCG，所有相关文档都排在前面）
+
+    # 이상적인 DCG (모든 정답이 앞에 배치된 경우)
     ideal_relevance_scores = [1] * len(golden_answer_list) + [0] * (len(sorted_docs) - len(golden_answer_list))
     idcg_value = dcg(ideal_relevance_scores)
-    
-    # 防止分母为零
+
+    # 분모가 0인 경우 처리
     if idcg_value == 0:
         return 0.0
-    
-    # 计算 NDCG
-    ndcg_value = dcg_value / idcg_value
-    return ndcg_value
+
+    return dcg_value / idcg_value
+
 
 def get_answer_from_predict_str(text):
+    """
+    모델 응답에서 <answer>...</answer> 태그 내용 추출
+
+    Args:
+        text: 모델의 전체 응답 문자열
+
+    Returns:
+        추출된 답변 문자열 또는 None
+    """
     end_tag = '</answer>'
     start_tag = '<answer>'
-    
+
+    # 마지막 </answer> 태그 위치 찾기
     end_pos = text.rfind(end_tag)
     if end_pos == -1:
-        return None  # 如果没有找到</answer>，返回None
-    
+        return None
+
+    # 해당 </answer> 앞의 <answer> 태그 찾기
     start_pos = text.rfind(start_tag, 0, end_pos)
     if start_pos == -1:
-        return None  # 如果没有找到<answer>，返回None
-    
-    start_pos += len(start_tag)  # 跳过<answer>标签
+        return None
+
+    # 태그 사이의 내용 추출
+    start_pos += len(start_tag)
     return text[start_pos:end_pos]
 
 
+# =============================================================================
+# 스트리밍 Reward 데이터 클래스
+# =============================================================================
+@dataclass
+class PromptRewardRequest:
+    """프롬프트 단위 Reward 요청"""
+    uid: str                        # 프롬프트 고유 ID
+    sample_indices: List[int]       # 배치 내 인덱스 (n_agent개)
+    samples_data: List[Dict]        # 각 샘플의 전처리된 데이터
+
+
+@dataclass
+class PromptRewardResult:
+    """프롬프트 단위 Reward 결과"""
+    uid: str                        # 프롬프트 고유 ID
+    sample_indices: List[int]       # 배치 내 인덱스
+    reward_scores: List[float]      # 각 샘플의 최종 점수
+    vlm_results: List[Dict]         # 각 샘플의 VLM 평가 결과
+    ndcg_values: List[float]        # 각 샘플의 NDCG 값
+
+
+# =============================================================================
+# RMManager 클래스
+# =============================================================================
 class RMManager:
-    """The reward manager.
-      Besides returning token level rewards, this manager records a detailed log
-    for each prompt and agent response to facilitate analysis of the GRPO
-    training process.
+    """
+    Gemini 3 Flash 기반 VLM as Judge Reward Manager
+
+    GSPO Phase 2 학습에서 모델의 추론 과정을 평가하여 보상을 계산합니다.
+
+    주요 기능:
+    1. 모델 응답에서 답변 추출 및 디코딩
+    2. Gemini VLM을 통한 추론 과정 평가
+    3. NDCG 기반 검색 품질 평가
+    4. 최종 보상 점수 계산 및 텐서 할당
+
+    Attributes:
+        tokenizer: 토크나이저 (응답 디코딩용)
+        log_path: JSONL 로그 파일 경로
+        image_base_path: 이미지 파일 기본 경로
+        gemini: Gemini 모델 인스턴스
     """
 
-    #def __init__(self, tokenizer, num_examine, compute_score=None,rm_url="http://0.0.0.0:8003/eval") -> None: 수정:log작성
-    #수정 추가본#
     def __init__(
         self,
         tokenizer,
-        num_examine,
-        compute_score=None, #수정 phase2
-        rm_url="http://0.0.0.0:8003/eval",
-        log_path="./logs/grpo_log.json",
-    ) -> None:
-    #추가 끝
+        num_examine: int = 0,
+        compute_score=None,
+        log_path: str = "./logs/grpo_log.jsonl",
+        gemini_model: str = "gemini-3-flash-preview",
+        image_base_path: str = "./data/images",
+        max_concurrent_requests: int = 50,
+    ):
+        """
+        RMManager 초기화
+
+        Args:
+            tokenizer: 토크나이저 인스턴스
+            num_examine: (미사용, 호환성 유지)
+            compute_score: (미사용, 호환성 유지)
+            log_path: 학습 로그 저장 경로 (JSONL 형식)
+            gemini_model: Gemini 모델 이름
+            image_base_path: 이미지 파일 기본 경로
+            max_concurrent_requests: 동시 API 호출 수 제한 (Gemini rate limit 대응)
+        """
         self.tokenizer = tokenizer
-        self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
-        self.compute_score = compute_score or _default_compute_score #phase2 수정
-        self.rm_url = rm_url
-        self.log_path = log_path #수정 추가 log 작성
+        self.log_path = log_path
+        self.image_base_path = image_base_path
 
-    def verify(self, data):
-        scores = []
-        for i in range(len(data)):
-            data_item = data[i]  # DataProtoItem
+        # =========================================================================
+        # 비동기 배치 처리 설정
+        # =========================================================================
+        # Gemini API rate limit 대응:
+        # - 분당 60 RPM (기본)
+        # - 동시 요청: ~10개 권장
+        # 세마포어로 동시 요청 수를 제한하여 rate limit 초과 방지
+        self.max_concurrent_requests = max_concurrent_requests
 
-            prompt_ids = data_item.batch['prompts']
+        # =========================================================================
+        # Gemini SDK 초기화 (Structured Output 설정)
+        # =========================================================================
+        # 환경 변수에서 API 키 로드
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY 환경 변수가 설정되지 않았습니다.")
 
-            prompt_length = prompt_ids.shape[-1]
+        genai.configure(api_key=api_key)
 
-            valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
-            valid_prompt_ids = prompt_ids[-valid_prompt_length:]
-
-            response_ids = data_item.batch['responses']
-            valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
-            valid_response_ids = response_ids[:valid_response_length]
-
-            # decode
-            # prompt_str = self.tokenizer.decode(valid_prompt_ids)
-            # response_str = self.tokenizer.decode(valid_response_ids)
-
-            # ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
-
-            # data_source = data_item.non_tensor_batch['data_source']
-
-            # extra_info = data_item.non_tensor_batch.get('extra_info', None)
-
-            #phase2 수정
-            # raw_score = self.compute_score( 
-            #     data_source=data_source,
-            #     solution_str=response_str,
-            #     ground_truth=ground_truth,
-            #     extra_info=extra_info,
-            # )
-            raw_score = 0.0
-            scores.append(raw_score)
-        data.batch['acc'] = torch.tensor(scores, dtype=torch.float32, device=prompt_ids.device)
-        return scores
-
-    def __call__(self, data: DataProto):
-        """We will expand this function gradually based on the available datasets"""
-
-        # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
-        if 'rm_scores' in data.batch.keys():
-            return data.batch['rm_scores']
-
-        
-        #로그에 학습 step 추가
-        step = data.batch.get('step', 'N/A')
-        step_key = f"step_{step}"
-        #//
-
-        #reward_tensor는 최종 점수들을 담을 '성적표'
-        reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
-
-        # 수정 wandb 로깅
-        ndcg_list = []
-        llm_judge_list = []
-
-        already_print_data_sources = {}
-
-        #수정 추가: log 작성#
-        if os.path.exists(self.log_path):
-            with open(self.log_path, "r") as f:
-                try:
-                    log_data = json.load(f)
-                except json.JSONDecodeError:
-                    log_data = {}
-        else:
-            log_data = {}
-        #수정 추가 끝
-
-        # log 학습 step 추기
-        if step_key not in log_data:
-            log_data[step_key] = {}
-        log_data_for_step = log_data[step_key]
-        #//
-
-        #각 답안지에서 '문제', '학생 답', '정답'을 깔끔하게 정리해서 '외부 채점 위원에게 보낼 서류 묶음'(data_eval)을 만듭니다.
-        #data_eval: 모든 데이터의 (질문, 생성 답변, 정답) 쌍이 들어있는 리스트.
-        data_eval = []
-        for i in range(len(data)):
-            data_item = data[i]
-            prompt_ids = data_item.batch['prompts']
-            prompt_length = prompt_ids.shape[-1]
-            response_ids = data_item.batch['responses']
-            valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
-            valid_response_ids = response_ids[:valid_response_length]
-            extra_info = data_item.non_tensor_batch.get('extra_info', None)
-            generated_answer = get_answer_from_predict_str(self.tokenizer.decode(valid_response_ids))
-            if generated_answer is None:
-                generated_answer = 'Please Judge False'
-            data_eval.append(dict(
-                query = extra_info['question'],
-                generated_answer = generated_answer,
-                reference_answer = data_item.non_tensor_batch['reward_model']['ground_truth']
-            ))
-
-        
-        data_to_be_eval = data_eval
-
-        eval_results = []
-
-        if len(data_to_be_eval) > 0:
-            request_data_to_be_eval = dict(
-                bs=300,
-                prompts=data_to_be_eval
-            )
-            #외부 api 수정 
-            #prompts_json = json.dumps(request_data_to_be_eval) #수정 외부 api 제거
-            print("=====================eval model start=====================")
-            #response = requests.post(self.rm_url, json=prompts_json) #외부 api 수정 제거
-            response = requests.post(self.rm_url, json=request_data_to_be_eval) #수정 추가 외부 api
-            eval_results = response.json()
-            print("=====================eval model end=====================")
-            ###############3
-            
-        for i in range(len(data)):
-            data_item = data[i]  # DataProtoItem
-
-            prompt_ids = data_item.batch['prompts']
-
-            prompt_length = prompt_ids.shape[-1]
-
-            valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
-            valid_prompt_ids = prompt_ids[-valid_prompt_length:]
-
-            response_ids = data_item.batch['responses']
-            valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
-            valid_response_ids = response_ids[:valid_response_length]
-
-            # decode
-            prompt_str = self.tokenizer.decode(valid_prompt_ids)
-            response_str = self.tokenizer.decode(valid_response_ids)
-
-            ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
-
-            data_source = data_item.non_tensor_batch['data_source']
-
-            extra_info = data_item.non_tensor_batch.get('extra_info', None)
-
-            #수정 phase2
-            # raw_score = self.compute_score(
-            #     data_source=data_source,
-            #     solution_str=response_str,
-            #     ground_truth=ground_truth,
-            #     extra_info=extra_info,
-            # )            
-           
-
-            # ###############수정 (삽입) ###########
-            # # 이유: 내부 점수 대신 API 결과와 NDCG 점수만으로 최종 점수를 계산합니다.
-            # model_eval_score = eval_results[i] if i < len(eval_results) else 0.0
-            # ndcg_value = 0.0
-            
-            # # if score > 0.0: # [주석 처리] 내부 점수 필터링을 제거합니다.
-            # try:
-            #     retrievaled_images_basename_list = [os.path.basename(item.rstrip('/')).split(".jpg")[0] for item in data_item.non_tensor_batch['retrievaled_images']]
-            #     reference_images_basename_list = [f'{extra_info["file_name"].split(".pdf")[0]}_{page}' for page in extra_info["reference_page"].tolist()]
-            #     ndcg_value = ndcg(retrievaled_images_basename_list, reference_images_basename_list)
-            # except Exception as e:
-            #      # NDCG 계산은 RAG 관련 데이터에만 해당하므로, 에러가 나도 무시하고 진행합니다.
-            #     pass
-
-            # score = 0.8 * float(model_eval_score) + 0.2 * ndcg_value
-            # #################수정 완료 (삽입) ###############
-
-            model_eval_score = 0.0
-            ndcg_value = 0.0
-            final_score = 0.0
-            retrievaled_images_basename_list = []
-            reference_images_basename_list = []
-
-
-            ################수정(주석 처리) ################    
-            #log 작성      
-
-            
-            retrievaled_images_basename_list = [os.path.basename(item.rstrip('/')).split(".jpg")[0] for item in data_item.non_tensor_batch['retrievaled_images']]
-            reference_images_basename_list = [f'{extra_info["file_name"].split(".pdf")[0]}_{page}' for page in extra_info["reference_page"].tolist()]
-            ndcg_value = ndcg(retrievaled_images_basename_list, reference_images_basename_list)
-            model_eval_score = eval_results.pop(0)
-                
-            final_score = 0.2*model_eval_score + 0.8*ndcg_value
-            
-            # 수정 wandb 로깅
-            ndcg_list.append(ndcg_value)
-            llm_judge_list.append(model_eval_score)
-
-            ################수정 완료(주석처리) #################
-
-            reward_tensor[i, valid_response_length - 1] = final_score
-
-
-            #old logging
-            # # structured logging
-            # uid = str(data_item.non_tensor_batch['uid'])
-            # query_key = uid
-            # if query_key not in log_data:
-            #     log_data[query_key] = {"prompt": prompt_str, "agents": []}
-
-            # agent_id = len(log_data[query_key]["agents"]) + 1
-            # log_data[query_key]["agents"].append(
-            #     {
-            #         "agent_id": agent_id,
-            #         "response": response_str,
-            #         "📣generated_answer📣": data_eval[i]['generated_answer'], 
-            #         "scores": {
-            #             "raw_score": raw_score,                        
-            #             "model_eval_score": model_eval_score,
-            #             "ndcg_value": ndcg_value,
-            #             "⭐️final_score⭐️": final_score,
-            #             "ndcg_details": {
-            #                 "retrieved_documents": retrievaled_images_basename_list,
-            #                 "reference_documents": reference_images_basename_list,
-            #             }
-
-            #         },
-            #     }
-            # )    
-            ####수정 추가 완료: log 작성###        
-            retrieved_image_files = [os.path.basename(p) for p in data_item.non_tensor_batch.get('retrievaled_images', [])]
-            
-            # 2. 로그에 기록할 response 문자열을 새로 만듭니다.
-            response_str_for_log = response_str
-            if retrieved_image_files:
-                # 이미지 경로로 채워진 보기 좋은 플레이스홀더를 만듭니다.
-                image_placeholder = f" [Image Paths: {', '.join(retrieved_image_files)}] "
-                # 정규표현식을 사용해 <|vision_start|>와 <|vision_end|> 사이의 모든 내용을 플레이스홀더로 교체합니다.
-                response_str_for_log = re.sub(
-                    r"(<\|vision_start\|>).*?(<\|vision_end\|>)",
-                    r"\1" + image_placeholder + r"\2",
-                    response_str,
-                    flags=re.DOTALL
-                )
-
-            # structured logging
-            uid = str(data_item.non_tensor_batch['uid'])
-            query_key = uid
-            #if query_key not in log_data:
-            if query_key not in log_data_for_step:
-                #log_data[query_key] = {"prompt": prompt_str, "agents": []}
-                log_data_for_step[query_key] = {"prompt": prompt_str, "agents": []}
-
-            #agent_id = len(log_data[query_key]["agents"]) + 1
-            agent_id = len(log_data_for_step[query_key]["agents"]) + 1
-            #log_data[query_key]["agents"].append(
-            log_data_for_step[query_key]["agents"].append(
-                {
-                    "agent_id": agent_id,
-                    "response": response_str_for_log,  
-                    "📣generated_answer📣": data_eval[i]['generated_answer'], 
-                    "scores": {
-                        #"raw_score": raw_score,                        
-                        "model_eval_score": model_eval_score,
-                        "ndcg_value": ndcg_value,
-                        "⭐️final_score⭐️": final_score,
-                        "ndcg_details": {
-                            "retrieved_documents": retrievaled_images_basename_list,
-                            "reference_documents": reference_images_basename_list,
-                        }
-
-                    },
-                }
-            )            
-
-            if data_source not in already_print_data_sources:
-                already_print_data_sources[data_source] = 0
-
-            if already_print_data_sources[data_source] < self.num_examine:
-                already_print_data_sources[data_source] += 1
-                print("[prompt]", prompt_str)
-                print("[response]", response_str)
-                print("[ground_truth]", ground_truth)
-                #print("[score]", score) 수정 제거: log 작성
-                print("[score]", final_score) #수정 추가 : log 작성
-
-        ###수정 추가:log 작성#
-        os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
-        with open(self.log_path, "w") as f:
-            json.dump(log_data, f, ensure_ascii=False, indent=2)            
-        ###수정 추가 끝: log 작성#
-
-        # 수정 wandb 로깅
-        metrics = {
-            'train/score/ndcg': np.mean(ndcg_list) if ndcg_list else 0.0,
-            'train/score/llm_judge': np.mean(llm_judge_list) if llm_judge_list else 0.0
+        # Structured Output 설정
+        # response_mime_type: JSON 응답 강제
+        # response_schema: 응답 구조 정의
+        # 참고: https://ai.google.dev/gemini-api/docs/structured-output
+        self.generation_config = {
+            "response_mime_type": "application/json",
+            "response_schema": VLM_RESPONSE_SCHEMA
         }
 
-        # 수정 wandb 로깅기존에는 reward_tensor만 리턴했지만, 이제 metrics도 함께 리턴
-        return reward_tensor, metrics
+        self.gemini = genai.GenerativeModel(
+            model_name=gemini_model,
+            generation_config=self.generation_config
+        )
 
+        print(f"[RMManager] Gemini 모델 초기화 완료: {gemini_model}")
+        print(f"[RMManager] Structured Output 활성화: JSON 스키마 적용")
+        print(f"[RMManager] 비동기 배치 처리: 최대 {max_concurrent_requests}개 동시 요청")
+        print(f"[RMManager] 로그 경로: {log_path}")
+        print(f"[RMManager] 이미지 경로: {image_base_path}")
 
-        
+        # =========================================================================
+        # 스트리밍 모드 설정
+        # =========================================================================
+        # 스트리밍 모드: 프롬프트 완료 시 즉시 Reward 계산 시작
+        # 배치 모드: 모든 Generation 완료 후 일괄 Reward 계산 (기존 방식)
+        self._streaming_mode: bool = False
+        self._request_queue: Optional[queue.Queue] = None
+        self._result_dict: Dict[str, PromptRewardResult] = {}
+        self._result_lock: threading.Lock = threading.Lock()
+        self._workers: List[threading.Thread] = []
+        self._shutdown_event: threading.Event = threading.Event()
+        self._num_worker_threads: int = 4
+
+    def __call__(self, data: DataProto):
+        """
+        보상 점수 계산 메인 함수
+
+        전체 흐름:
+        1. 단일 루프로 전처리 (디코딩, 메타데이터 추출)
+        2. Gemini VLM Judge 호출
+        3. 점수 계산 및 텐서 할당
+        4. JSONL 로그 저장
+
+        Args:
+            data: DataProto 객체 (배치 데이터)
+
+        Returns:
+            tuple: (reward_tensor, metrics)
+                - reward_tensor: (batch_size, response_length) 형태의 보상 텐서
+                - metrics: wandb 로깅용 평균 메트릭 딕셔너리
+        """
+        # =========================================================================
+        # 1. reward_tensor 초기화
+        # =========================================================================
+        # response와 동일한 shape의 zero 텐서 생성
+        # 마지막 유효 토큰 위치에만 점수가 할당됨
+        reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
+
+        # =========================================================================
+        # 2. 단일 루프: 전처리 (최적화 포인트 - 중복 순회 제거)
+        # =========================================================================
+        # 기존 구현은 2번 순회했지만, 여기서는 1번만 순회하며 모든 정보 추출
+        preprocessed = []
+
+        for i in range(len(data)):
+            data_item = data[i]
+
+            # -----------------------------------------------------------------
+            # 2.1 텐서 데이터 추출
+            # -----------------------------------------------------------------
+            prompt_ids = data_item.batch['prompts']
+            prompt_length = prompt_ids.shape[-1]
+            response_ids = data_item.batch['responses']
+
+            # attention_mask로 유효한 토큰 길이 계산 (1회만 계산)
+            valid_response_length = int(
+                data_item.batch['attention_mask'][prompt_length:].sum()
+            )
+
+            # -----------------------------------------------------------------
+            # 2.2 응답 디코딩 (1회만 수행 - 최적화 포인트)
+            # -----------------------------------------------------------------
+            valid_response_ids = response_ids[:valid_response_length]
+            response_str = self.tokenizer.decode(valid_response_ids)
+
+            # -----------------------------------------------------------------
+            # 2.3 메타데이터 추출
+            # -----------------------------------------------------------------
+            extra_info = data_item.non_tensor_batch.get('extra_info', {})
+            ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
+
+            # -----------------------------------------------------------------
+            # 2.4 이미지 경로 추출
+            # -----------------------------------------------------------------
+            # 검색된 이미지 (모델이 검색한 이미지)
+            retrieved_images = data_item.non_tensor_batch.get('retrievaled_images', [])
+
+            # NDCG 계산용 basename 추출
+            retrieved_basenames = [
+                os.path.basename(item.rstrip('/')).split(".jpg")[0]
+                for item in retrieved_images
+            ]
+
+            # 정답 이미지 basename 구성
+            reference_basenames = []
+            if 'file_name' in extra_info and 'reference_page' in extra_info:
+                reference_basenames = [
+                    f'{extra_info["file_name"].split(".pdf")[0]}_{page}'
+                    for page in extra_info["reference_page"].tolist()
+                ]
+
+            # 정답 이미지 경로 구성 (VLM 평가용)
+            reference_image_paths = self._build_reference_image_paths(
+                extra_info.get('file_name', ''),
+                extra_info.get('reference_page', [])
+            )
+
+            # -----------------------------------------------------------------
+            # 2.5 전처리 결과 저장
+            # -----------------------------------------------------------------
+            preprocessed.append({
+                'index': i,
+                'response_str': response_str,           # 전체 추론 경로
+                'valid_response_length': valid_response_length,
+                'query': extra_info.get('question', ''),
+                'reference_answer': ground_truth,
+                'retrieved_images': retrieved_images,   # VLM용 검색 이미지 경로
+                'reference_image_paths': reference_image_paths,  # VLM용 정답 이미지 경로
+                'retrieved_basenames': retrieved_basenames,      # NDCG용
+                'reference_basenames': reference_basenames,      # NDCG용
+            })
+
+        # =========================================================================
+        # 3. Gemini VLM Judge 비동기 배치 호출
+        # =========================================================================
+        # 성능 비교:
+        # - 순차 처리: 32개 샘플 × 2초 = 64초
+        # - 비동기 처리 (10개 동시): 32 / 10 × 2초 ≈ 7초 (~9배 향상)
+        vlm_scores = self._run_async_batch_evaluate(preprocessed)
+
+        # =========================================================================
+        # 4. 점수 계산 및 텐서 할당
+        # =========================================================================
+        metrics = {
+            'ndcg': [],
+            'vlm_score': [],
+            'final_score': [],
+            # Structured Output에서 제공하는 세부 점수
+            'answer_accuracy': [],
+            'visual_grounding': [],
+            'reasoning_consistency': [],
+        }
+        log_entries = []
+
+        for i, item in enumerate(preprocessed):
+            vlm_result = vlm_scores[i]
+
+            # -----------------------------------------------------------------
+            # 4.1 NDCG 계산
+            # -----------------------------------------------------------------
+            ndcg_value = ndcg(item['retrieved_basenames'], item['reference_basenames'])
+
+            # -----------------------------------------------------------------
+            # 4.2 최종 점수 계산: 0.8 * VLM + 0.2 * NDCG
+            # -----------------------------------------------------------------
+            vlm_score = vlm_result.get('final_score', 0.0)
+            final_score = 0.8 * vlm_score + 0.2 * ndcg_value
+
+            # -----------------------------------------------------------------
+            # 4.3 reward_tensor에 할당
+            # -----------------------------------------------------------------
+            # 마지막 유효 토큰 위치에만 점수 할당 (verl 프레임워크 요구사항)
+            reward_tensor[i, item['valid_response_length'] - 1] = final_score
+
+            # -----------------------------------------------------------------
+            # 4.4 메트릭 수집
+            # -----------------------------------------------------------------
+            metrics['ndcg'].append(ndcg_value)
+            metrics['vlm_score'].append(vlm_score)
+            metrics['final_score'].append(final_score)
+
+            # 세부 점수 수집 (Structured Output에서 제공)
+            metrics['answer_accuracy'].append(vlm_result.get('answer_accuracy', 0.0))
+            metrics['visual_grounding'].append(vlm_result.get('visual_grounding', 0.0))
+            metrics['reasoning_consistency'].append(vlm_result.get('reasoning_consistency', 0.0))
+
+            # -----------------------------------------------------------------
+            # 4.5 로그 엔트리 생성
+            # -----------------------------------------------------------------
+            log_entries.append({
+                'query': item['query'],
+                'response': item['response_str'][:1000],  # 로그 크기 제한
+                'vlm_result': vlm_result,
+                'ndcg': ndcg_value,
+                'final_score': final_score,
+            })
+
+        # =========================================================================
+        # 5. JSONL 로그 저장 (append 모드 - 최적화 포인트)
+        # =========================================================================
+        # 기존: 전체 파일 읽기 → 수정 → 전체 쓰기 (O(n))
+        # 개선: append 모드로 추가만 (O(1))
+        with open(self.log_path, 'a') as f:
+            for entry in log_entries:
+                f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+
+        # =========================================================================
+        # 6. 평균 메트릭 계산 및 반환
+        # =========================================================================
+        def safe_mean(lst):
+            return sum(lst) / len(lst) if lst else 0.0
+
+        avg_metrics = {
+            # 주요 점수
+            'reward/ndcg_mean': safe_mean(metrics['ndcg']),
+            'reward/vlm_score_mean': safe_mean(metrics['vlm_score']),
+            'reward/final_score_mean': safe_mean(metrics['final_score']),
+            # 세부 점수 (Structured Output)
+            'reward/answer_accuracy_mean': safe_mean(metrics['answer_accuracy']),
+            'reward/visual_grounding_mean': safe_mean(metrics['visual_grounding']),
+            'reward/reasoning_consistency_mean': safe_mean(metrics['reasoning_consistency']),
+        }
+
+        print(f"[RMManager] 배치 처리 완료: {len(preprocessed)}개 샘플")
+        print(f"[RMManager] 평균 점수 - NDCG: {avg_metrics['reward/ndcg_mean']:.4f}, "
+              f"VLM: {avg_metrics['reward/vlm_score_mean']:.4f}, "
+              f"Final: {avg_metrics['reward/final_score_mean']:.4f}")
+
+        return reward_tensor, avg_metrics
+
+    # =========================================================================
+    # 비동기 배치 처리 메서드들
+    # =========================================================================
+    # GRPO 학습 특성상 n_generation 개수만큼 한꺼번에 보상 계산이 필요
+    # 순차 처리 시 병목 발생 → 비동기 병렬 처리로 ~9배 성능 향상
+    #
+    # 구조:
+    # _run_async_batch_evaluate (동기 진입점)
+    #   └─ _async_batch_vlm_evaluate (비동기 배치 처리)
+    #       └─ _async_evaluate_single (개별 샘플 평가, 세마포어 제어)
+    #           └─ _prepare_vlm_input (입력 준비)
+
+    def _run_async_batch_evaluate(self, preprocessed: list) -> list:
+        """
+        동기 컨텍스트에서 비동기 배치 평가 실행
+
+        GRPO 학습 루프는 동기 컨텍스트이므로, 비동기 코드를 실행하기 위한
+        진입점 역할을 합니다.
+
+        Args:
+            preprocessed: 전처리된 데이터 리스트
+
+        Returns:
+            각 샘플의 VLM 평가 결과 리스트
+        """
+        try:
+            # 이미 이벤트 루프가 실행 중인지 확인
+            loop = asyncio.get_running_loop()
+            # 이미 async 컨텍스트인 경우 (드문 케이스)
+            # ThreadPoolExecutor로 새 스레드에서 실행
+            with ThreadPoolExecutor() as executor:
+                future = executor.submit(
+                    asyncio.run,
+                    self._async_batch_vlm_evaluate(preprocessed)
+                )
+                return future.result()
+        except RuntimeError:
+            # 일반적인 동기 컨텍스트 (대부분의 경우)
+            return asyncio.run(self._async_batch_vlm_evaluate(preprocessed))
+
+    async def _async_batch_vlm_evaluate(self, preprocessed: list) -> list:
+        """
+        비동기 배치 VLM 평가
+
+        asyncio.gather를 사용하여 모든 샘플을 병렬로 평가합니다.
+        세마포어로 동시 요청 수를 제한하여 rate limit을 준수합니다.
+
+        Args:
+            preprocessed: 전처리된 데이터 리스트
+
+        Returns:
+            각 샘플의 VLM 평가 결과 리스트 (입력 순서 유지)
+        """
+        # 세마포어 생성 (동시 요청 수 제한)
+        semaphore = asyncio.Semaphore(self.max_concurrent_requests)
+
+        # 모든 샘플에 대해 비동기 태스크 생성
+        tasks = [
+            self._async_evaluate_single(item, idx, semaphore)
+            for idx, item in enumerate(preprocessed)
+        ]
+
+        # 병렬 실행 (return_exceptions=True로 개별 실패가 전체를 중단시키지 않음)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Exception 결과를 기본값으로 변환
+        processed_results = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                print(f"[RMManager] VLM 평가 실패 (샘플 {i}): {result}")
+                processed_results.append(self._default_result(str(result)))
+            else:
+                processed_results.append(result)
+
+        return processed_results
+
+    async def _async_evaluate_single(
+        self,
+        item: dict,
+        idx: int,
+        semaphore: asyncio.Semaphore,
+        max_retries: int = 3,
+        base_delay: float = 1.0
+    ) -> dict:
+        """
+        단일 샘플 비동기 평가 (세마포어로 동시성 제어 + 재시도 로직)
+
+        세마포어를 사용하여 동시 API 호출 수를 제한합니다.
+        이는 Gemini API rate limit (분당 60 RPM)을 준수하기 위함입니다.
+
+        재시도 로직:
+        - 최대 max_retries번 재시도 (기본 3번)
+        - 지수 백오프: 1초 → 2초 → 4초 (rate limit 대응)
+        - 모든 재시도 실패 시 기본값 반환
+
+        Args:
+            item: 전처리된 샘플 데이터
+            idx: 샘플 인덱스 (로깅용)
+            semaphore: 동시성 제어용 세마포어
+            max_retries: 최대 재시도 횟수 (기본 3)
+            base_delay: 재시도 기본 대기 시간 (초)
+
+        Returns:
+            VLM 평가 결과 딕셔너리
+        """
+        async with semaphore:
+            # 1. VLM 입력 준비 (이미지 로드 + 프롬프트 구성)
+            # 이 단계는 재시도 대상이 아님 (로컬 작업)
+            images, prompt = self._prepare_vlm_input(item)
+
+            # 2. 이미지가 없으면 기본값 반환 (재시도 불필요)
+            if not images:
+                return self._default_result('no_images')
+
+            # 3. Gemini API 호출 (재시도 대상)
+            content = images + [prompt]
+            last_error = None
+
+            for attempt in range(max_retries):
+                try:
+                    response = await self.gemini.generate_content_async(content)
+                    # 성공 시 즉시 반환
+                    return self._parse_vlm_response(response.text)
+
+                except Exception as e:
+                    last_error = e
+                    # 마지막 시도가 아니면 재시도
+                    if attempt < max_retries - 1:
+                        # 지수 백오프: 1초 → 2초 → 4초
+                        delay = base_delay * (2 ** attempt)
+                        print(f"[RMManager] 샘플 {idx} 재시도 {attempt + 1}/{max_retries} "
+                              f"({delay:.1f}초 후): {e}")
+                        await asyncio.sleep(delay)
+                    else:
+                        # 모든 재시도 실패
+                        print(f"[RMManager] 샘플 {idx} 최종 실패 "
+                              f"({max_retries}번 시도): {e}")
+
+            # 모든 재시도 실패 시 기본값 반환
+            return self._default_result(f"max_retries_exceeded: {last_error}")
+
+    def _prepare_vlm_input(self, item: dict) -> tuple:
+        """
+        VLM 입력 준비 (이미지 로드 + 프롬프트 구성)
+
+        검색된 이미지와 정답 이미지를 로드하고, VLM Judge 프롬프트를 구성합니다.
+
+        Args:
+            item: 전처리된 샘플 데이터
+
+        Returns:
+            tuple: (이미지 리스트, 프롬프트 문자열)
+        """
+        images = []
+        retrieved_count = 0
+        reference_count = 0
+
+        # 1. 검색된 이미지들 로드
+        for img_path in item['retrieved_images']:
+            if os.path.exists(img_path):
+                images.append(Image.open(img_path))
+                retrieved_count += 1
+
+        # 2. 정답 이미지들 로드
+        for img_path in item.get('reference_image_paths', []):
+            if os.path.exists(img_path):
+                images.append(Image.open(img_path))
+                reference_count += 1
+
+        # 3. 프롬프트 구성
+        image_desc = f"[Retrieved: {retrieved_count}, Reference: {reference_count}]"
+        prompt = VLM_JUDGE_PROMPT.format(
+            query=item['query'],
+            full_response=item['response_str'],  # <think>, <search>, <bbox>, <answer> 포함
+            reference_answer=item['reference_answer'],
+            image_description=image_desc,
+        )
+
+        return images, prompt
+
+    def _default_result(self, error: str) -> dict:
+        """
+        기본 결과 (에러 시 반환)
+
+        API 호출 실패나 이미지 없음 등의 경우에 반환되는 기본값입니다.
+        학습 안정성을 위해 0점을 부여합니다.
+
+        Args:
+            error: 에러 메시지
+
+        Returns:
+            기본값이 설정된 결과 딕셔너리
+        """
+        return {
+            'answer_accuracy': 0.0,
+            'visual_grounding': 0.0,
+            'reasoning_consistency': 0.0,
+            'final_score': 0.0,
+            'error': error
+        }
+
+    def _parse_vlm_response(self, text: str) -> dict:
+        """
+        VLM 응답 JSON 파싱
+
+        Gemini Structured Output을 사용하므로 응답이 이미 JSON 형식입니다.
+        response_mime_type="application/json" 설정으로 JSON 응답이 보장됩니다.
+
+        Args:
+            text: Gemini 응답 텍스트 (JSON 형식)
+
+        Returns:
+            파싱된 JSON 딕셔너리 또는 기본값
+        """
+        # 기본값 정의
+        default_response = {
+            'answer_accuracy': 0.0,
+            'visual_grounding': 0.0,
+            'reasoning_consistency': 0.0,
+            'final_score': 0.0,
+            'parse_error': True
+        }
+
+        try:
+            # Structured Output 사용 시 응답이 이미 JSON 형식
+            result = json.loads(text)
+
+            # 필수 필드 검증 및 기본값 보완
+            return {
+                'answer_accuracy': float(result.get('answer_accuracy', 0.0)),
+                'visual_grounding': float(result.get('visual_grounding', 0.0)),
+                'reasoning_consistency': float(result.get('reasoning_consistency', 0.0)),
+                'final_score': float(result.get('final_score', 0.0)),
+            }
+
+        except json.JSONDecodeError as e:
+            print(f"[RMManager] JSON 파싱 실패: {e}")
+            return default_response
+        except Exception as e:
+            print(f"[RMManager] VLM 응답 파싱 실패: {e}")
+            return default_response
+
+    def _build_reference_image_paths(self, file_name: str, reference_pages) -> list:
+        """
+        정답 이미지 경로 구성
+
+        PDF 파일명과 페이지 번호를 바탕으로 이미지 파일 경로를 생성합니다.
+
+        Args:
+            file_name: PDF 파일명 (예: "document.pdf")
+            reference_pages: 정답 페이지 번호 리스트 또는 numpy 배열
+
+        Returns:
+            정답 이미지 파일 경로 리스트
+        """
+        if not file_name:
+            return []
+
+        # numpy 배열인 경우 리스트로 변환
+        if hasattr(reference_pages, 'tolist'):
+            pages = reference_pages.tolist()
+        elif isinstance(reference_pages, list):
+            pages = reference_pages
+        else:
+            return []
+
+        base_name = file_name.split(".pdf")[0]
+        paths = []
+
+        for page in pages:
+            # 이미지 경로 패턴: {base_path}/{base_name}_{page}.jpg
+            img_path = os.path.join(self.image_base_path, f"{base_name}_{page}.jpg")
+            paths.append(img_path)
+
+        return paths
+
+    # =========================================================================
+    # 스트리밍 Reward 계산 메서드들
+    # =========================================================================
+    # Producer-Consumer 패턴으로 Generation과 Reward 계산을 병렬화
+    #
+    # 흐름:
+    # 1. start_streaming_mode(): Worker 스레드 시작
+    # 2. submit_prompt(): 프롬프트 완료 시 Queue에 요청 추가
+    # 3. _streaming_worker_loop(): Worker가 Queue에서 요청 처리
+    # 4. wait_and_get_streaming_rewards(): 모든 결과 수집
+    # 5. stop_streaming_mode(): Worker 종료
+
+    def start_streaming_mode(self, num_worker_threads: int = 4):
+        """
+        스트리밍 모드 시작 - Generation 전에 호출
+
+        Worker 스레드를 시작하여 프롬프트 완료 시 즉시 Reward 계산을 시작합니다.
+        각 Worker는 자체 이벤트 루프를 가지고 비동기 API 호출을 처리합니다.
+
+        Args:
+            num_worker_threads: Worker 스레드 수 (기본 4개)
+        """
+        if self._streaming_mode:
+            print("[RMManager] 스트리밍 모드가 이미 활성화되어 있습니다.")
+            return
+
+        self._streaming_mode = True
+        self._num_worker_threads = num_worker_threads
+        self._shutdown_event.clear()
+        self._request_queue = queue.Queue()
+        self._result_dict.clear()
+        self._workers.clear()
+
+        # Worker 스레드 시작
+        for i in range(num_worker_threads):
+            worker = threading.Thread(
+                target=self._streaming_worker_loop,
+                name=f"StreamingRewardWorker-{i}",
+                daemon=True
+            )
+            worker.start()
+            self._workers.append(worker)
+
+        print(f"[RMManager] 스트리밍 모드 시작: {num_worker_threads}개 워커")
+
+    def submit_prompt(
+        self,
+        uid: str,
+        sample_indices: List[int],
+        samples_data: List[Dict]
+    ):
+        """
+        프롬프트 완료 시 Reward 계산 요청 제출
+
+        Generation에서 프롬프트의 모든 샘플(n_agent개)이 완료되면
+        이 메서드를 호출하여 Reward 계산을 요청합니다.
+
+        Args:
+            uid: 프롬프트 고유 ID
+            sample_indices: 배치 내 샘플 인덱스들 (n_agent개)
+            samples_data: 각 샘플의 전처리된 데이터
+        """
+        if not self._streaming_mode:
+            raise RuntimeError(
+                "스트리밍 모드가 활성화되지 않았습니다. "
+                "start_streaming_mode()를 먼저 호출하세요."
+            )
+
+        request = PromptRewardRequest(
+            uid=uid,
+            sample_indices=sample_indices,
+            samples_data=samples_data
+        )
+        self._request_queue.put(request)
+
+    def wait_and_get_streaming_rewards(
+        self,
+        total_prompts: int,
+        timeout: float = 600.0
+    ) -> Dict[str, PromptRewardResult]:
+        """
+        모든 Reward 완료 대기 후 결과 반환
+
+        Generation 완료 후 호출하여 아직 처리 중인 Reward 계산을 기다립니다.
+        대부분의 Reward는 Generation 중에 이미 완료되어 있을 것입니다.
+
+        Args:
+            total_prompts: 예상 총 프롬프트 수 (검증용)
+            timeout: 최대 대기 시간 (초, 기본 10분)
+
+        Returns:
+            uid -> PromptRewardResult 딕셔너리
+        """
+        if not self._streaming_mode:
+            raise RuntimeError("스트리밍 모드가 활성화되지 않았습니다.")
+
+        # Queue가 빌 때까지 대기 (모든 요청 처리 완료)
+        # join()은 queue가 empty가 될 때까지 blocking
+        try:
+            self._request_queue.join()
+        except Exception as e:
+            print(f"[RMManager] Queue join 중 에러: {e}")
+
+        with self._result_lock:
+            completed = len(self._result_dict)
+            print(f"[RMManager] 스트리밍 완료: {completed}/{total_prompts} 프롬프트")
+
+            if completed < total_prompts:
+                print(f"[RMManager] 경고: 일부 프롬프트 결과 누락 "
+                      f"({total_prompts - completed}개)")
+
+            return dict(self._result_dict)
+
+    def stop_streaming_mode(self):
+        """
+        스트리밍 모드 종료 - Worker 스레드 정리
+
+        모든 Worker 스레드에 종료 신호를 보내고, 정리가 완료될 때까지 대기합니다.
+        """
+        if not self._streaming_mode:
+            return
+
+        # 종료 신호 전송
+        self._shutdown_event.set()
+
+        # Worker 스레드 종료 대기
+        for worker in self._workers:
+            worker.join(timeout=5.0)
+            if worker.is_alive():
+                print(f"[RMManager] 경고: {worker.name} 종료 시간 초과")
+
+        self._workers.clear()
+        self._streaming_mode = False
+        print("[RMManager] 스트리밍 모드 종료")
+
+    def _streaming_worker_loop(self):
+        """
+        Worker 스레드 메인 루프
+
+        Queue에서 요청을 가져와 비동기로 VLM 평가를 수행합니다.
+        각 Worker는 자체 asyncio 이벤트 루프를 가집니다.
+        """
+        # 각 워커가 자체 이벤트 루프 생성 (스레드별로 별도 루프 필요)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        worker_name = threading.current_thread().name
+
+        try:
+            while not self._shutdown_event.is_set():
+                try:
+                    # 0.1초 타임아웃으로 종료 신호 확인 가능하게
+                    request = self._request_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+
+                try:
+                    # 비동기 평가 실행
+                    result = loop.run_until_complete(
+                        self._evaluate_prompt_streaming(request)
+                    )
+
+                    with self._result_lock:
+                        self._result_dict[request.uid] = result
+
+                except Exception as e:
+                    print(f"[{worker_name}] Error for uid={request.uid}: {e}")
+                    # 에러 시 기본값 저장
+                    with self._result_lock:
+                        self._result_dict[request.uid] = \
+                            self._create_default_streaming_result(request)
+
+                finally:
+                    # task_done() 호출로 join()이 완료 감지 가능
+                    self._request_queue.task_done()
+
+        finally:
+            loop.close()
+
+    async def _evaluate_prompt_streaming(
+        self,
+        request: PromptRewardRequest
+    ) -> PromptRewardResult:
+        """
+        프롬프트의 모든 샘플을 비동기 평가
+
+        기존 _async_evaluate_single 로직을 재사용하되,
+        프롬프트 단위로 결과를 묶어서 반환합니다.
+
+        Args:
+            request: 프롬프트 Reward 요청
+
+        Returns:
+            프롬프트 단위 Reward 결과
+        """
+        # 워커별로 세마포어 분배 (전체 동시 요청 수 / 워커 수)
+        semaphore = asyncio.Semaphore(
+            max(1, self.max_concurrent_requests // self._num_worker_threads)
+        )
+
+        async def evaluate_single(sample_data: Dict, local_idx: int):
+            """단일 샘플 평가 (클로저로 semaphore 공유)"""
+            async with semaphore:
+                # 기존 VLM 평가 로직 재사용
+                images, prompt = self._prepare_vlm_input(sample_data)
+
+                if not images:
+                    return local_idx, self._default_result('no_images'), 0.0
+
+                try:
+                    content = images + [prompt]
+                    response = await self.gemini.generate_content_async(content)
+                    vlm_result = self._parse_vlm_response(response.text)
+                except Exception as e:
+                    vlm_result = self._default_result(str(e))
+
+                # NDCG 계산
+                ndcg_value = ndcg(
+                    sample_data.get('retrieved_basenames', []),
+                    sample_data.get('reference_basenames', [])
+                )
+
+                # 최종 점수: 0.8 * VLM + 0.2 * NDCG
+                vlm_score = vlm_result.get('final_score', 0.0)
+                final_score = 0.8 * vlm_score + 0.2 * ndcg_value
+                vlm_result['final_score_combined'] = final_score
+
+                return local_idx, vlm_result, ndcg_value
+
+        # 모든 샘플에 대해 비동기 태스크 생성
+        tasks = [
+            evaluate_single(data, i)
+            for i, data in enumerate(request.samples_data)
+        ]
+
+        # 병렬 실행
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 결과 정리
+        n = len(request.samples_data)
+        reward_scores = [0.0] * n
+        vlm_results = [{}] * n
+        ndcg_values = [0.0] * n
+
+        for result in results:
+            if isinstance(result, Exception):
+                print(f"[RMManager] 샘플 평가 실패: {result}")
+                continue
+            local_idx, vlm, ndcg_val = result
+            # final_score_combined는 0.8*VLM + 0.2*NDCG
+            reward_scores[local_idx] = vlm.get('final_score_combined', 0.0)
+            vlm_results[local_idx] = vlm
+            ndcg_values[local_idx] = ndcg_val
+
+        return PromptRewardResult(
+            uid=request.uid,
+            sample_indices=request.sample_indices,
+            reward_scores=reward_scores,
+            vlm_results=vlm_results,
+            ndcg_values=ndcg_values
+        )
+
+    def _create_default_streaming_result(
+        self,
+        request: PromptRewardRequest
+    ) -> PromptRewardResult:
+        """
+        에러 시 기본값 반환
+
+        Worker에서 예외 발생 시 학습을 중단하지 않고
+        0점 기본값을 반환하여 안정성을 유지합니다.
+
+        Args:
+            request: 원본 요청
+
+        Returns:
+            기본값이 설정된 결과
+        """
+        n = len(request.samples_data)
+        return PromptRewardResult(
+            uid=request.uid,
+            sample_indices=request.sample_indices,
+            reward_scores=[0.0] * n,
+            vlm_results=[{'error': 'worker_failed'}] * n,
+            ndcg_values=[0.0] * n
+        )
