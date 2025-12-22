@@ -342,6 +342,15 @@ class RayPPOTrainer(object):
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
 
+        # [NEW] 스트리밍 Reward 모드 설정
+        # config.reward_model.streaming_reward.enable = True로 활성화
+        self.streaming_reward_enabled = getattr(
+            getattr(config.reward_model, 'streaming_reward', None),
+            'enable', False
+        )
+        if self.streaming_reward_enabled:
+            print("[RayPPOTrainer] 스트리밍 Reward 모드 활성화")
+
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, 'Currently, only support hybrid engine'
 
@@ -746,6 +755,76 @@ class RayPPOTrainer(object):
                                                     prefix=logging_prefix)
         metrics.update(global_balance_stats)
 
+    def _convert_streaming_rewards_to_tensor(
+        self,
+        batch,
+        reward_results: dict
+    ):
+        """
+        스트리밍 Reward 결과를 텐서로 변환
+
+        스트리밍 모드에서 수집된 PromptRewardResult 딕셔너리를
+        verl 프레임워크가 요구하는 reward_tensor 형태로 변환합니다.
+
+        Args:
+            batch: DataProto 배치 데이터
+            reward_results: uid -> PromptRewardResult 딕셔너리
+
+        Returns:
+            tuple: (reward_tensor, metrics)
+                - reward_tensor: (batch_size, response_length) 형태
+                - metrics: wandb 로깅용 메트릭
+        """
+        import numpy as np
+
+        response_length = batch.batch['responses'].shape[-1]
+        batch_size = len(batch)
+        reward_tensor = torch.zeros((batch_size, response_length), dtype=torch.float32)
+
+        all_scores = []
+        all_ndcg = []
+        all_vlm_scores = []
+
+        for uid, result in reward_results.items():
+            for i, sample_idx in enumerate(result.sample_indices):
+                if sample_idx >= batch_size:
+                    continue
+
+                # attention_mask에서 유효한 응답 길이 계산
+                attention_mask = batch.batch['attention_mask'][sample_idx]
+                prompt_len = batch.batch['prompts'].shape[-1]
+                valid_len = int(attention_mask[prompt_len:].sum())
+
+                # 마지막 유효 토큰 위치에 점수 할당
+                if valid_len > 0:
+                    reward_tensor[sample_idx, valid_len - 1] = result.reward_scores[i]
+
+                all_scores.append(result.reward_scores[i])
+                all_ndcg.append(result.ndcg_values[i])
+
+                # VLM 점수 추출
+                vlm_result = result.vlm_results[i]
+                if isinstance(vlm_result, dict):
+                    vlm_score = vlm_result.get('final_score', 0.0)
+                    all_vlm_scores.append(vlm_score)
+
+        # 메트릭 계산
+        def safe_mean(lst):
+            return sum(lst) / len(lst) if lst else 0.0
+
+        metrics = {
+            'reward/streaming_final_score_mean': safe_mean(all_scores),
+            'reward/streaming_ndcg_mean': safe_mean(all_ndcg),
+            'reward/streaming_vlm_score_mean': safe_mean(all_vlm_scores),
+            'reward/streaming_prompts_processed': len(reward_results),
+        }
+
+        print(f"[RayPPOTrainer] 스트리밍 Reward 변환 완료: "
+              f"final={metrics['reward/streaming_final_score_mean']:.4f}, "
+              f"ndcg={metrics['reward/streaming_ndcg_mean']:.4f}")
+
+        return reward_tensor, metrics
+
     def fit(self):
         """
         The training loop of PPO.
@@ -789,6 +868,8 @@ class RayPPOTrainer(object):
             processor=self.processor,
             actor_rollout_wg=self.actor_rollout_wg,
             config=gen_config,
+            # [NEW] 스트리밍 모드일 때만 reward_fn 전달
+            streaming_reward_manager=self.reward_fn if self.streaming_reward_enabled else None,
         )
 
         # start training loop
@@ -847,6 +928,11 @@ class RayPPOTrainer(object):
                         gen_monitor = GPUMonitor()
                         gen_monitor = GPUMonitor(log_file=log_filename, label = "Generation")
                         gen_monitor.start()
+
+                        # [NEW] 스트리밍 모드: 워커 시작
+                        if self.streaming_reward_enabled:
+                            self.reward_fn.start_streaming_mode(num_worker_threads=4)
+
                         ###
                         generation_manager.timing_raw = timing_raw
                         final_gen_batch_output = generation_manager.run_llm_loop(
@@ -917,14 +1003,28 @@ class RayPPOTrainer(object):
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
 
-                        # 수정 wandb 로깅
-                        # reward_tensor = self.reward_fn(batch)   #설명:생성된 답변 점수를 미기기 위해 호출 
-                        # batch.batch['token_level_scores'] = reward_tensor
+                        # [MODIFIED] 스트리밍 vs 배치 모드 분기
+                        if self.streaming_reward_enabled:
+                            # 스트리밍 모드: 결과 수집 및 텐서 변환
+                            num_prompts = self.config.data.train_batch_size
+                            reward_results = self.reward_fn.wait_and_get_streaming_rewards(
+                                total_prompts=num_prompts
+                            )
 
-                        # [수정 후] 
-                        reward_tensor, reward_metrics = self.reward_fn(batch)
-                        batch.batch['token_level_scores'] = reward_tensor
-                        metrics.update(reward_metrics)
+                            # 결과를 reward_tensor로 변환
+                            reward_tensor, reward_metrics = self._convert_streaming_rewards_to_tensor(
+                                batch, reward_results
+                            )
+                            batch.batch['token_level_scores'] = reward_tensor
+                            metrics.update(reward_metrics)
+
+                            # 워커 종료
+                            self.reward_fn.stop_streaming_mode()
+                        else:
+                            # 기존 배치 모드
+                            reward_tensor, reward_metrics = self.reward_fn(batch)
+                            batch.batch['token_level_scores'] = reward_tensor
+                            metrics.update(reward_metrics)
 
                         # compute rewards. apply_kl_penalty if available
                         if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
