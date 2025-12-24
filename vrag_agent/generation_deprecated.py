@@ -1,7 +1,7 @@
 import torch
 import re
 import numpy as np
-from collections import defaultdict, deque
+from collections import defaultdict
 import os
 from typing import List, Dict, Any, Tuple
 from dataclasses import dataclass
@@ -26,50 +26,6 @@ import random as _random
 from lsm_tmp.gpu_monitor import GPUMonitor
 from datetime import datetime
 # ▲▲▲[성능 측정 추가]▲▲▲
-
-# =============================================================================
-# [Phase 2] 텐서 연산 최적화용 로깅 유틸리티
-# =============================================================================
-import logging
-
-# Phase 2 전용 로거 설정
-_phase2_logger = logging.getLogger("generation.phase2_optimization")
-_phase2_logger.setLevel(logging.DEBUG)
-
-# 콘솔 핸들러 (INFO 레벨 이상)
-if not _phase2_logger.handlers:
-    _console_handler = logging.StreamHandler()
-    _console_handler.setLevel(logging.INFO)
-    _console_handler.setFormatter(logging.Formatter(
-        '[Phase2] %(asctime)s - %(levelname)s - %(message)s',
-        datefmt='%H:%M:%S'
-    ))
-    _phase2_logger.addHandler(_console_handler)
-
-# 성능 측정 환경변수 플래그 (기본값: False)
-_PHASE2_PERF_LOG_ENABLED = os.getenv("PHASE2_PERF_LOG", "0") == "1"
-
-
-class Phase2PerfTimer:
-    """Phase 2 최적화 함수의 성능 측정을 위한 컨텍스트 매니저"""
-
-    def __init__(self, func_name: str, batch_size: int = None):
-        self.func_name = func_name
-        self.batch_size = batch_size
-        self.start_time = None
-        self.elapsed_ms = None
-
-    def __enter__(self):
-        if _PHASE2_PERF_LOG_ENABLED:
-            self.start_time = _time.perf_counter()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if _PHASE2_PERF_LOG_ENABLED and self.start_time:
-            self.elapsed_ms = (_time.perf_counter() - self.start_time) * 1000
-            batch_info = f" (batch_size={self.batch_size})" if self.batch_size else ""
-            _phase2_logger.info(f"{self.func_name}{batch_info}: {self.elapsed_ms:.3f}ms")
-        return False
 
 
 # ===== (1) DashScope 설정 =====
@@ -163,23 +119,6 @@ def _to_image_part(path: str) -> dict | None:
 # <<< ADDED 끝
 
 
-# =============================================================================
-# [Phase 4] 이미지 로딩 캐싱 (LRU Cache)
-# - 동일 이미지에 대한 반복 로딩 시 디스크 I/O 회피
-# - maxsize=64: 배치 크기 고려한 캐시 크기 (메모리 vs 성능 트레이드오프)
-# =============================================================================
-from functools import lru_cache
-
-@lru_cache(maxsize=64)
-def _cached_image_open(path: str) -> 'Image.Image':
-    """
-    캐시된 이미지 로딩 함수
-
-    동일 경로에 대한 반복 호출 시 캐시에서 반환합니다.
-    주의: 반환된 이미지는 원본이므로 수정 시 .copy() 필요
-    """
-    return Image.open(path)
-
 
 def process_image(image, max_pixels: int = 2048 * 2048, min_pixels: int = 512 * 512):
     import math
@@ -208,45 +147,7 @@ def process_image(image, max_pixels: int = 2048 * 2048, min_pixels: int = 512 * 
     return image
 
 #수정 추가
-FORCED_COMPLETION_RESPONSE = "<think>Maximum turn limit reached. Trigger search_complete.</think><search_complete>true</search_complete>"
-
-# =============================================================================
-# [Phase 1] 사전 컴파일된 정규식 패턴 (성능 최적화)
-# - 모듈 로드 시 1회만 컴파일하여 재사용
-# - 매 호출마다 re.compile() 오버헤드 제거
-# =============================================================================
-_RE_EXTRACT_TAGS = re.compile(r"<(search|think|bbox|search_complete)>(.*?)</\1>", re.DOTALL)
-_RE_ACTION_PATTERN = re.compile(r'<(search|bbox|search_complete)>(.*?)</\1>', re.DOTALL)
-_RE_UID_SUFFIX = re.compile(r'(\d+)$')
-
-# =============================================================================
-# [Phase 3] 루프 최적화용 상수
-# - 루프 내에서 반복 생성되던 문자열을 모듈 레벨 상수로 추출
-# - 가독성 향상 및 유지보수 용이
-# =============================================================================
-_MSG_INVALID_BBOX = (
-    '\n<|im_start|>user\n'
-    'Your previous action is invalid. \n'
-    ' The bbox format is invalid. Expected format: JSON array [x1, y1, x2, y2] with all values >= 0. '
-    'Please try again.\n'
-    '<|im_end|>\n<|im_start|>assistant\n'
-)
-
-_MSG_INVALID_ACTION = (
-    '\n<|im_start|>user\n'
-    'Your previous action is invalid. '
-    'You must conduct reasoning inside <think> and </think> every time you get new information. '
-    'After reasoning, if you find you lack some knowledge, you can call a search engine using <search> query </search> and the user will return the search results. '
-    'Whenever you retrieve an image, you may crop it for a clearer view using <bbox>[x1, y1, x2, y2]</bbox>. '
-    'You can search as many times as you want. '
-    'If you determine that no further external knowledge is needed, you must finish with <search_complete>true</search_compelte>. '
-    'Otherwise, continue with <search> or <bbox> actions until you are ready to finish. '
-    'Please try again.\n'
-    '<|im_end|>\n<|im_start|>assistant\n'
-)
-
-# run_llm_loop에서 사용하는 키 리스트 (루프 불변)
-_CUT_KEYS = ['input_ids', 'attention_mask', 'position_ids']
+FORCED_COMPLETION_RESPONSE = "<think>Maximum turn limit reached. Trigger search_complete.</think><search_complete>true</search_complete>"    
 
 @dataclass
 class GenerationConfig:
@@ -297,38 +198,8 @@ class LLMGenerationManager:
         # [NEW] 스트리밍 Reward Manager
         self.streaming_reward_manager = streaming_reward_manager
         self._prompt_completion_status: Dict[str, Dict] = {}
+                
 
-        # [Phase 4] 비동기 이미지 저장을 위한 ThreadPoolExecutor
-        # - 이미지 저장은 I/O 바운드 작업으로 GIL 영향 적음
-        # - max_workers=4: 일반적인 디스크 I/O 병렬 처리에 적합
-        self._save_executor = ThreadPoolExecutor(max_workers=4)
-        self._pending_saves: List = []  # 완료 대기 중인 저장 작업
-
-    def _ensure_saves_complete(self) -> int:
-        """
-        [Phase 4] 모든 비동기 이미지 저장 완료 대기
-
-        Returns:
-            int: 완료된 저장 작업 수
-        """
-        if not self._pending_saves:
-            return 0
-
-        completed = 0
-        errors = []
-        for future in self._pending_saves:
-            try:
-                future.result(timeout=30)  # 30초 타임아웃
-                completed += 1
-            except Exception as e:
-                errors.append(str(e))
-
-        self._pending_saves.clear()
-
-        if errors:
-            print(f"[Phase 4] Image save errors ({len(errors)}): {errors[:3]}...")
-
-        return completed
 
     def _batch_tokenize(self, responses: List[str]) -> torch.Tensor:
         """Tokenize a batch of responses."""
@@ -357,8 +228,8 @@ class LLMGenerationManager:
         )
 
         def extract_tags(text):
-            # [Phase 1] 사전 컴파일된 정규식 사용 (성능 최적화)
-            matches = _RE_EXTRACT_TAGS.findall(text)
+            pattern = r"<(search|think|bbox|search_complete)>(.*?)</\1>" # generator 수정
+            matches = re.findall(pattern, text, re.DOTALL)
             result = "\n".join([f"<{tag}>{content}</{tag}>" for tag, content in matches])
             return result
 
@@ -486,23 +357,22 @@ class LLMGenerationManager:
                     next_obs_str.append(obs_item)
                     multi_modal_data.append({'image': []})
                     multi_modal_inputs.append(BatchFeature(dict()))
-
+                
                 # 2. Invalid Action (No previous image)
                 elif isinstance(obs_item, list) and not isinstance(obs_item[0],dict) and len(self.retrievaled_images[idx]) == 0:
                     next_obs_str.append('\n<|im_start|>user\nInvalid action: No image to crop. Please search first.\n<|im_end|>\n<|im_start|>assistant\n')
                     multi_modal_data.append({'image': []})
                     multi_modal_inputs.append(BatchFeature(dict()))
-
+                
                 # 3. [BBOX / CROP] 구간
                 elif isinstance(obs_item,list) and not isinstance(obs_item[0],dict):
                     try:
                         # 기존 로직 수행
                         latest_image = rollings.non_tensor_batch['multi_modal_data'][idx]['image'][-1]
                         width, height = latest_image.size
-                        # [Phase 4] LRU 캐시 적용: 동일 이미지 반복 로딩 시 디스크 I/O 회피
-                        raw_images_crop = _cached_image_open(self.retrievaled_images[idx][-1])
+                        raw_images_crop = Image.open(self.retrievaled_images[idx][-1])
                         raw_width, raw_height = raw_images_crop.size
-
+                        
                         if self.is_validation:
                             obs_item = [obs_item[0]-28, obs_item[1]-28, obs_item[2]+28, obs_item[3]+28]
                         crop_area = [int(raw_width * obs_item[0] / width), int(raw_height * obs_item[1] / height), int(raw_width * obs_item[2] / width), int(raw_height * obs_item[3] / height)]
@@ -511,23 +381,19 @@ class LLMGenerationManager:
                         raw_images_list = [process_image(image, 512*28*28, 256*28*28) for image in input_images_list]
 
                         # generator added
-                        # [Phase 4] 비동기 이미지 저장: 블로킹 I/O를 백그라운드로 이동
                         crop_path = os.path.join(self.config.crops_dir, f"{uuid.uuid4().hex}.jpg")
-                        # 이미지 복사 후 비동기 저장 (원본 객체 수정 방지)
-                        img_to_save = raw_images_list[0].copy()
-                        future = self._save_executor.submit(img_to_save.save, crop_path)
-                        self._pending_saves.append(future)
+                        raw_images_list[0].save(crop_path)
                         self.cropped_images[idx].append(crop_path)
 
-                        image_inputs = self.processor.image_processor(raw_images_list, return_tensors='pt')
-
+                        image_inputs = self.processor.image_processor(raw_images_list, return_tensors='pt') 
+                        
                         # [검증] pixel_values 확인
                         if 'pixel_values' in image_inputs:
                             multi_modal_data.append({'image': raw_images_list})
                             multi_modal_inputs.append(image_inputs)
                             image_grid_thw = image_inputs['image_grid_thw']
                             obs_str = ''.join([f"<|vision_start|>{self.processor.image_token * (image_grid_thw_item.prod() // merge_length)}<|vision_end|>" for image_grid_thw_item in image_grid_thw])
-                            raw_obs_str = f"<|vision_start|>{self.processor.image_token}<|vision_end|>" * len(image_grid_thw)
+                            raw_obs_str = f"<|vision_start|>{self.processor.image_token}<|vision_end|>" * len(image_grid_thw) 
                             obs_str = '\n<|im_start|>user\n' + obs_str + '<|im_end|>\n<|im_start|>assistant\n'
                             next_obs_str.append(obs_str)
                         else:
@@ -538,7 +404,7 @@ class LLMGenerationManager:
                         print(f"[DEBUG] Bbox Error at idx {idx}: {e}")
                         next_obs_str.append('\n<|im_start|>user\n[System Error: Bbox Crop Failed] The image crop operation failed. Please try a different action.\n<|im_end|>\n<|im_start|>assistant\n')
                         multi_modal_data.append({'image': []})
-                        multi_modal_inputs.append(BatchFeature(dict()))
+                        multi_modal_inputs.append(BatchFeature(dict())) 
 
                 # 4. [SEARCH / RETRIEVAL] 구간
                 elif isinstance(obs_item,list) and isinstance(obs_item[0],dict):
@@ -659,68 +525,34 @@ class LLMGenerationManager:
     #                         rollings.non_tensor_batch['multi_modal_inputs'][idx]['image_grid_thw'] = dummy_grid
     #                 # ▲▲▲ [수정 끝] ▲▲▲
     #     return rollings
-    def _concat_multi_modal_data(self, rollings, next_obs_multi_modal_data: list, next_obs_multi_modal_inputs: list):
-        """
-        [Phase 2 최적화] 롤링 상태에 멀티모달 데이터를 연결합니다.
+    def _concat_multi_modal_data(self, rollings, next_obs_multi_modal_data:list, next_obs_multi_modal_inputs:list):
+        if not 'multi_modal_inputs' in rollings.non_tensor_batch.keys():
+            rollings.non_tensor_batch['multi_modal_inputs'] = np.empty(len(next_obs_multi_modal_data), dtype=object)
+            for idx, item in enumerate(next_obs_multi_modal_inputs):
+                rollings.non_tensor_batch['multi_modal_inputs'][idx] = item
 
-        최적화 내용:
-        - 반복적인 딕셔너리 접근을 로컬 변수로 캐싱
-        - 조건문 구조 개선으로 불필요한 체크 감소
-        - 성능 로깅: Phase2PerfTimer로 측정 가능 (PHASE2_PERF_LOG=1)
-        """
-        with Phase2PerfTimer("_concat_multi_modal_data", batch_size=len(next_obs_multi_modal_data)):
+            rollings.non_tensor_batch['multi_modal_data'] = np.array(next_obs_multi_modal_data, dtype=object)
 
-            # [Phase 2] 자주 접근하는 딕셔너리를 로컬 변수로 캐싱
-            non_tensor_batch = rollings.non_tensor_batch
-
-            if 'multi_modal_inputs' not in non_tensor_batch:
-                # 초기화 케이스
-                non_tensor_batch['multi_modal_inputs'] = np.empty(len(next_obs_multi_modal_data), dtype=object)
-                for idx, item in enumerate(next_obs_multi_modal_inputs):
-                    non_tensor_batch['multi_modal_inputs'][idx] = item
-
-                non_tensor_batch['multi_modal_data'] = np.array(next_obs_multi_modal_data, dtype=object)
-
-            else:
-                # [Phase 2] 기존 데이터를 로컬 변수로 캐싱
-                existing_multi_modal_data = non_tensor_batch['multi_modal_data']
-                existing_multi_modal_inputs = non_tensor_batch['multi_modal_inputs']
-
-                for idx, multi_modal_data_item in enumerate(next_obs_multi_modal_data):
-                    # [Phase 2] 이미지가 없으면 조기 종료 (불필요한 체크 회피)
-                    if len(multi_modal_data_item['image']) == 0:
-                        continue
-
-                    new_inputs = next_obs_multi_modal_inputs[idx]
-
+        else:
+            for idx, multi_modal_data_item in enumerate(next_obs_multi_modal_data):
+                if len(multi_modal_data_item['image']) > 0:
+                    
                     # 방어 로직: pixel_values가 있을 때만 병합
-                    if 'pixel_values' not in new_inputs:
-                        continue
-
-                    # [Phase 2] 로컬 변수 캐싱으로 딕셔너리 접근 횟수 감소
-                    existing_inputs = existing_multi_modal_inputs[idx]
-                    existing_data = existing_multi_modal_data[idx]
-
-                    # 이미지 리스트 확장
-                    existing_data['image'].extend(multi_modal_data_item['image'])
-
-                    # 텐서 연결
-                    if 'pixel_values' in existing_inputs:
-                        # [Phase 2] 기존 텐서와 새 텐서 연결
-                        existing_inputs['pixel_values'] = torch.cat(
-                            (existing_inputs['pixel_values'], new_inputs['pixel_values']),
-                            dim=0
-                        )
-                        existing_inputs['image_grid_thw'] = torch.cat(
-                            (existing_inputs['image_grid_thw'], new_inputs['image_grid_thw']),
-                            dim=0
-                        )
+                    if 'pixel_values' in next_obs_multi_modal_inputs[idx]:
+                        rollings.non_tensor_batch['multi_modal_data'][idx]['image'].extend(multi_modal_data_item['image'])
+                        
+                        if 'pixel_values' in rollings.non_tensor_batch['multi_modal_inputs'][idx]:
+                            rollings.non_tensor_batch['multi_modal_inputs'][idx]['pixel_values'] = torch.cat((rollings.non_tensor_batch['multi_modal_inputs'][idx]['pixel_values'], next_obs_multi_modal_inputs[idx]['pixel_values']),dim=0)
+                            rollings.non_tensor_batch['multi_modal_inputs'][idx]['image_grid_thw'] = torch.cat((rollings.non_tensor_batch['multi_modal_inputs'][idx]['image_grid_thw'], next_obs_multi_modal_inputs[idx]['image_grid_thw']),dim=0)
+                        else:
+                            rollings.non_tensor_batch['multi_modal_inputs'][idx]['pixel_values'] = next_obs_multi_modal_inputs[idx]['pixel_values']
+                            rollings.non_tensor_batch['multi_modal_inputs'][idx]['image_grid_thw'] = next_obs_multi_modal_inputs[idx]['image_grid_thw']
                     else:
-                        # 첫 번째 이미지인 경우 직접 할당
-                        existing_inputs['pixel_values'] = new_inputs['pixel_values']
-                        existing_inputs['image_grid_thw'] = new_inputs['image_grid_thw']
+                        # 텍스트에서 이미 이미지 토큰을 뺐으므로, 여기서는 그냥 넘어가도 안전합니다.
+                        # print(f"Skipping concatenation for idx {idx} (No pixel values)") 
+                        pass 
 
-            return rollings
+        return rollings
 #//
 
     def _update_rolling_state(self, rollings, cur_responses: torch.Tensor, 
@@ -776,170 +608,101 @@ class LLMGenerationManager:
 
     def _generate_with_gpu_padding(self, active_batch: DataProto) -> DataProto:
         """
-        [Phase 2 최적화] Wrapper for generation that handles multi-GPU padding requirements.
-
-        최적화 내용:
-        - 텐서 연산 통합: 3회 torch.cat → 더 효율적인 구조로 개선
-        - non_tensor_batch 처리: 중첩 루프 제거, 리스트 곱셈 활용
-        - 성능 로깅: Phase2PerfTimer로 측정 가능 (PHASE2_PERF_LOG=1)
+            Wrapper for generation that handles multi-GPU padding requirements.
+            if num_gpus <= 1, return self.actor_rollout_wg.generate_sequences(active_batch)
+            if active_batch size is not divisible by num_gpus, pad with first sequence
+            then remove padding from output
         """
-        with Phase2PerfTimer("_generate_with_gpu_padding",
-                            batch_size=active_batch.batch['input_ids'].shape[0] if active_batch.batch else None):
+        num_gpus = self.config.num_gpus
+        if num_gpus <= 1:
+            return self.actor_rollout_wg.generate_sequences(active_batch)
+            
+        batch_size = active_batch.batch['input_ids'].shape[0]
+        remainder = batch_size % num_gpus
+        
+        if remainder == 0:
+            return self.actor_rollout_wg.generate_sequences(active_batch)
+            
+        # Add padding sequences
+        padding_size = num_gpus - remainder
+        padded_batch = {}
+        padded_non_tensor_batch = {}
 
-            num_gpus = self.config.num_gpus
-            if num_gpus <= 1:
-                return self.actor_rollout_wg.generate_sequences(active_batch)
+        padded_ids = self.tokenizer(
+            ['<|im_start|>user\nHi, who are u?<|im_end|>\n<|im_start|>assistant\n'], 
+            padding='longest',
+            return_tensors='pt',
+            add_special_tokens=False,  # Prevents adding special tokens
+        )['input_ids']
+        padded_ids = padded_ids[0]
 
-            batch_size = active_batch.batch['input_ids'].shape[0]
-            remainder = batch_size % num_gpus
+        pad_input_ids = torch.full_like(active_batch.batch['input_ids'][0], 151643, dtype=torch.int64)
+        pad_input_ids[:len(padded_ids)] = padded_ids
+        pad_attention_mask = self.tensor_fn.create_attention_mask(pad_input_ids)
+        pad_input_ids = pad_input_ids.unsqueeze(0)
+        pad_attention_mask = pad_attention_mask.unsqueeze(0)
+        pad_position_ids = self.tensor_fn.create_position_ids(pad_attention_mask)
+        
+        padded_batch['attention_mask'] = torch.cat([active_batch.batch['attention_mask'], pad_attention_mask.repeat(padding_size, *[1] * (len(active_batch.batch['attention_mask'].shape) - 1))], dim=0)
+        padded_batch['input_ids'] = torch.cat([active_batch.batch['input_ids'], pad_input_ids.repeat(padding_size, *[1] * (len(active_batch.batch['input_ids'].shape) - 1))], dim=0)
+        padded_batch['position_ids'] = torch.cat([active_batch.batch['position_ids'], pad_position_ids.repeat(padding_size, *[1] * (len(active_batch.batch['position_ids'].shape) - 1))], dim=0)
+        
 
-            if remainder == 0:
-                return self.actor_rollout_wg.generate_sequences(active_batch)
-
-            # Add padding sequences
-            padding_size = num_gpus - remainder
-
-            # [Phase 2] 패딩 ID 토크나이징 (1회만 수행)
-            padded_ids = self.tokenizer(
-                ['<|im_start|>user\nHi, who are u?<|im_end|>\n<|im_start|>assistant\n'],
-                padding='longest',
-                return_tensors='pt',
-                add_special_tokens=False,
-            )['input_ids'][0]  # 바로 [0] 인덱싱
-
-            # [Phase 2] 패딩 텐서 생성
-            pad_input_ids = torch.full_like(active_batch.batch['input_ids'][0], 151643, dtype=torch.int64)
-            pad_input_ids[:len(padded_ids)] = padded_ids
-            pad_attention_mask = self.tensor_fn.create_attention_mask(pad_input_ids)
-            pad_input_ids = pad_input_ids.unsqueeze(0)
-            pad_attention_mask = pad_attention_mask.unsqueeze(0)
-            pad_position_ids = self.tensor_fn.create_position_ids(pad_attention_mask)
-
-            # [Phase 2] 텐서 배치 구성 - 반복 횟수 사전 계산
-            # repeat 인자를 미리 계산하여 재사용
-            repeat_dims_2d = (padding_size, 1)  # 2D 텐서용
-
-            padded_batch = {
-                'attention_mask': torch.cat([
-                    active_batch.batch['attention_mask'],
-                    pad_attention_mask.repeat(*repeat_dims_2d)
-                ], dim=0),
-                'input_ids': torch.cat([
-                    active_batch.batch['input_ids'],
-                    pad_input_ids.repeat(*repeat_dims_2d)
-                ], dim=0),
-                'position_ids': torch.cat([
-                    active_batch.batch['position_ids'],
-                    pad_position_ids.repeat(*repeat_dims_2d)
-                ], dim=0),
-            }
-
-            # [Phase 2] Non-tensor batch 처리 최적화
-            # - 중첩 루프 제거: 리스트 곱셈으로 대체
-            # - 각 키별 처리를 인라인화
-            padded_non_tensor_batch = {}
-            list_ids = padded_ids.tolist()  # 1회만 변환
-
-            for k, v in active_batch.non_tensor_batch.items():
-                if k == 'raw_prompt_ids':
-                    # 리스트 곱셈으로 동일한 객체 참조 (메모리 효율)
-                    pad_items = [list_ids] * padding_size
-                elif k == 'multi_modal_inputs':
-                    # 각각 새로운 딕셔너리 생성 (mutable 객체이므로)
-                    pad_items = [{} for _ in range(padding_size)]
-                elif k == 'multi_modal_data':
-                    pad_items = [{'image': []} for _ in range(padding_size)]
+        for k, v in active_batch.non_tensor_batch.items():
+            pad_non_tensor_item = np.empty(padding_size, dtype=object)
+            if k == 'raw_prompt_ids':
+                list_ids = padded_ids.tolist()
+                for idx in range(padding_size):
+                    pad_non_tensor_item[idx] = list_ids
+            elif k == 'multi_modal_inputs':
+                for idx in range(padding_size):
+                    pad_non_tensor_item[idx] = {}
+            elif k == 'multi_modal_data':
+                for idx in range(padding_size):
+                    pad_non_tensor_item[idx] = {'image': []}
+            padded_non_tensor_batch[k] = np.concatenate([v, pad_non_tensor_item])
+                
+        padded_active_batch = DataProto.from_dict(padded_batch, padded_non_tensor_batch)
+        
+        # Generate with padded batch
+        padded_output = self.actor_rollout_wg.generate_sequences(padded_active_batch)
+        
+        # Remove padding from output
+        trimmed_batch = {k: v[:-padding_size] for k, v in padded_output.batch.items()}
+        
+        # Handle meta_info if present
+        if hasattr(padded_output, 'meta_info') and padded_output.meta_info:
+            trimmed_meta = {}
+            for k, v in padded_output.meta_info.items():
+                if isinstance(v, torch.Tensor):
+                    trimmed_meta[k] = v[:-padding_size]
                 else:
-                    # 알 수 없는 키: None으로 패딩
-                    pad_items = [None] * padding_size
-
-                pad_non_tensor_item = np.array(pad_items, dtype=object)
-                padded_non_tensor_batch[k] = np.concatenate([v, pad_non_tensor_item])
-
-            padded_active_batch = DataProto.from_dict(padded_batch, padded_non_tensor_batch)
-
-            # Generate with padded batch
-            padded_output = self.actor_rollout_wg.generate_sequences(padded_active_batch)
-
-            # [Phase 2] Remove padding from output - 딕셔너리 컴프리헨션 유지 (이미 효율적)
-            trimmed_batch = {k: v[:-padding_size] for k, v in padded_output.batch.items()}
-
-            # Handle meta_info if present
-            if hasattr(padded_output, 'meta_info') and padded_output.meta_info:
-                trimmed_meta = {}
-                for k, v in padded_output.meta_info.items():
-                    if isinstance(v, torch.Tensor):
-                        trimmed_meta[k] = v[:-padding_size]
-                    else:
-                        trimmed_meta[k] = v
-                padded_output.meta_info = trimmed_meta
-
-            padded_output.batch = trimmed_batch
-            return padded_output
+                    trimmed_meta[k] = v
+            padded_output.meta_info = trimmed_meta
+            
+        padded_output.batch = trimmed_batch
+        return padded_output
 
     def _raw_prompt_ids(self, rollings):
-        """
-        [Phase 2 최적화] 롤링 상태의 input_ids에서 연속된 이미지 토큰(151655)을 압축합니다.
-
-        최적화 내용:
-        - 내부 함수를 메서드 레벨로 이동하여 매번 정의하는 오버헤드 제거
-        - 텐서 연산 최적화: torch 마스킹 활용
-        - 성능 로깅: Phase2PerfTimer로 측정 가능 (PHASE2_PERF_LOG=1)
-        """
-        with Phase2PerfTimer("_raw_prompt_ids", batch_size=rollings.batch['input_ids'].shape[0]):
-
-            # [Phase 2] long() 변환
-            input_ids = rollings.batch['input_ids'].long()
-            attention_mask = rollings.batch['attention_mask']
-
-            # [Phase 2] 배치 처리를 위한 텐서 마스킹 활용
-            # 각 샘플별로 유효한 토큰만 추출
-            batch_size = input_ids.shape[0]
-            raw_next_obs_ids = []
-
-            for idx in range(batch_size):
-                # 마스크가 1인 위치의 토큰만 추출
-                valid_ids = input_ids[idx][attention_mask[idx] == 1].tolist()
-
-                # 연속된 이미지 토큰 압축 (인라인 처리)
-                compressed = self._compress_consecutive_tokens(valid_ids, 151655)
-                raw_next_obs_ids.append(compressed)
-
-            raw_next_obs_ids = np.array(raw_next_obs_ids, dtype=object)
-            rollings.non_tensor_batch['raw_prompt_ids'] = raw_next_obs_ids
-            rollings.batch['input_ids'] = input_ids  # long() 변환된 버전 저장
-
-            return rollings
-
-    def _compress_consecutive_tokens(self, arr: list, target: int) -> list:
-        """
-        [Phase 2] 연속된 target 토큰을 하나로 압축합니다.
-
-        Args:
-            arr: 토큰 ID 리스트
-            target: 압축할 대상 토큰 (예: 151655 = 이미지 토큰)
-
-        Returns:
-            압축된 토큰 리스트
-        """
-        if not arr:
-            return arr
-
-        result = []
-        i = 0
-        n = len(arr)
-
-        while i < n:
-            if arr[i] == target:
-                result.append(target)
-                # 연속된 target 건너뛰기
-                while i + 1 < n and arr[i + 1] == target:
-                    i += 1
-            else:
-                result.append(arr[i])
-            i += 1
-
-        return result
+        new_raw_prompt_ids = []
+        rollings.batch['input_ids'] = rollings.batch['input_ids'].long()
+        raw_next_obs_ids = [ids[mask == 1].tolist() for ids, mask in zip(np.array(rollings.batch['input_ids']),  np.array(rollings.batch['attention_mask']))]
+        def replace_consecutive_elements(arr, target):
+            result = []
+            i = 0
+            while i < len(arr):
+                if arr[i] == target:
+                    result.append(target)
+                    while i + 1 < len(arr) and arr[i + 1] == target:
+                        i += 1
+                else:
+                    result.append(arr[i])
+                i += 1
+            return result
+        raw_next_obs_ids = [replace_consecutive_elements(row,151655) for row in raw_next_obs_ids]
+        raw_next_obs_ids = np.array(raw_next_obs_ids, dtype=object)
+        rollings.non_tensor_batch['raw_prompt_ids'] = raw_next_obs_ids
+        return rollings
 
     def deactivate_batch(self, active_mask,rollings):
         raw_prompt_ids = rollings.non_tensor_batch['raw_prompt_ids']
@@ -1002,17 +765,13 @@ class LLMGenerationManager:
         self.retrievaled_images = [[] for _ in range(gen_batch.batch['input_ids'].shape[0])]
         self.cropped_images = [[] for _ in range(gen_batch.batch['input_ids'].shape[0])]      # generator added
 
-        # [Phase 3] 루프 불변값 추출: max_turns - 1 계산을 루프 외부로 이동
-        last_turn_idx = self.config.max_turns - 1
-
         ############======================🚀Main generation loop🚀==================######################
         for step in range(self.config.max_turns):
             if not active_mask.sum():
                 break
-            # [Phase 3] 루프 불변 상수 사용
             rollings.batch = self.tensor_fn.cut_to_effective_len(
                 rollings.batch,
-                keys=_CUT_KEYS
+                keys=['input_ids', 'attention_mask', 'position_ids']
             ) #데이터 압축
 
             rollings = self._raw_prompt_ids(rollings)#전처리 
@@ -1032,12 +791,11 @@ class LLMGenerationManager:
             #         k: v[active_mask] for k, v in rollings.batch.items()
             #     })  
             
-            # [Phase 3] 루프 불변값 사용: last_turn_idx
-            is_last_turn = step == last_turn_idx
+            #수정 추가 max turn5              
+            is_last_turn = step == self.config.max_turns - 1
 
             if not is_last_turn:
-                # [Phase 3] .keys() 제거: in dict가 더 효율적
-                if 'multi_modal_inputs' in rollings.non_tensor_batch:
+                if 'multi_modal_inputs' in rollings.non_tensor_batch.keys():
                     rollings_active = DataProto.from_dict(
                         tensors={k: v[active_mask] for k, v in rollings.batch.items()},
                         non_tensors={k: v[active_mask] for k, v in rollings.non_tensor_batch.items()}
@@ -1136,19 +894,18 @@ class LLMGenerationManager:
         # final LLM rollout
         if active_mask.sum():
 
-            # [Phase 3] 루프 불변 상수 사용
             rollings.batch = self.tensor_fn.cut_to_effective_len(
                 rollings.batch,
-                keys=_CUT_KEYS
+                keys=['input_ids', 'attention_mask', 'position_ids']
             )
-
+            
             rollings = self._raw_prompt_ids(rollings)
 
             active_mask = self.deactivate_batch(active_mask, rollings)
 
             if active_mask.sum():
-                # [Phase 3] .keys() 제거: in dict가 더 효율적
-                if 'multi_modal_inputs' in rollings.non_tensor_batch:
+
+                if 'multi_modal_inputs' in rollings.non_tensor_batch.keys():
                     rollings_active = DataProto.from_dict(
                         tensors={k: v[active_mask] for k, v in rollings.batch.items()},
                         non_tensors={k: v[active_mask] for k, v in rollings.non_tensor_batch.items()}
@@ -1229,12 +986,8 @@ class LLMGenerationManager:
         rollings = self._update_rolling_state(
             rollings, ans_ids, next_obs_ids=torch.zeros((ans_ids.shape[0], 0), dtype=torch.long)
         )
-
-        # [Phase 4] 모든 비동기 이미지 저장 완료 대기
-        saved_count = self._ensure_saves_complete()
-        if saved_count > 0:
-            print(f"[Phase 4] Async image saves completed: {saved_count}")
-
+        #
+        
         return self._compose_final_output(original_left_side, original_right_side, meta_info, rollings)
     
     def _add_noisy_multi_modal_data(self, rollings, original_right_side):
@@ -1387,21 +1140,19 @@ class LLMGenerationManager:
         cur_actions, contents = self.postprocess_predictions(predictions)  
 
         next_obs, dones = [], []
-
-        # [Phase 3] deque 사용: pop(0) O(n) → popleft() O(1)
-        bbox_queue = deque(content for action, content in zip(cur_actions, contents) if action == 'bbox')
+        
+        bbox_list = [content for action, content in zip(cur_actions, contents) if action == 'bbox']
         
         search_requests = []
         for i, (action, content) in enumerate(zip(cur_actions, contents)):
             if action == 'search':
-                # [Phase 1] 사전 컴파일된 정규식 사용 (성능 최적화)
-                m = _RE_UID_SUFFIX.search(str(uids[i]))
+                m = re.search(r'(\d+)$', str(uids[i]))
                 search_id = int(m.group(1)) if m else -1
-
+                
                 search_requests.append({
                     "query": content,
                     "id": str(search_id),
-                    "request_idx": i
+                    "request_idx": i  
                 })                   
 
         if do_search:
@@ -1441,14 +1192,13 @@ class LLMGenerationManager:
                     dones.append(0)
                 elif action == 'bbox':
                     try:
-                        bbox_value = json.loads(bbox_queue.popleft())
+                        bbox_value = json.loads(bbox_list.pop(0))
                         if len(bbox_value) == 4 and bbox_value[0] >= 0 and bbox_value[1] >= 0 and bbox_value[2] >= 0 and bbox_value[3] >= 0:
                             next_obs.append(bbox_value)
                         else:
                             raise ValueError("Invalid bbox value")
                     except:
-                        # [Phase 3] 상수 사용
-                        next_obs.append(_MSG_INVALID_BBOX)
+                        next_obs.append('\n<|im_start|>user\nYour previous action is invalid. \n The bbox format is invalid. Expected format: JSON array [x1, y1, x2, y2] with all values >= 0. Please try again.\n<|im_end|>\n<|im_start|>assistant\n')
                     dones.append(0)
                 elif action == 'search_complete':
                     is_true = contents[i].strip().lower() == 'true'
@@ -1462,8 +1212,7 @@ class LLMGenerationManager:
                     next_obs.append('')
                     dones.append(1)  # trajectory 종료
                 else:
-                    # [Phase 3] 상수 사용
-                    next_obs.append(_MSG_INVALID_ACTION)
+                    next_obs.append('\n<|im_start|>user\nYour previous action is invalid. You must conduct reasoning inside <think> and </think> every time you get new information. After reasoning, if you find you lack some knowledge, you can call a search engine using <search> query </search> and the user will return the search results. Whenever you retrieve an image, you may crop it for a clearer view using <bbox>[x1, y1, x2, y2]</bbox>. You can search as many times as you want. If you determine that no further external knowledge is needed, you must finish with <search_complete>true</search_compelte>. Otherwise, continue with <search> or <bbox> actions until you are ready to finish. Please try again.\n<|im_end|>\n<|im_start|>assistant\n')
                     dones.append(0)
         
         # 모든 결과를 소비했는지 최종 확인
@@ -1501,14 +1250,18 @@ class LLMGenerationManager:
                 #//
 
                 else:
-                    # [Phase 1] 사전 컴파일된 정규식 사용 (성능 최적화)
-                    match = _RE_ACTION_PATTERN.search(prediction)
+                    #수정 mac turn5
+                    # content = ''
+                    # action = None
+                    pattern = r'<(search|bbox|search_complete)>(.*?)</\1>'
+                    match = re.search(pattern, prediction, re.DOTALL)
                     if match:
                         content = match.group(2).strip()  # Return only the content inside the tags
                         action = match.group(1)
                     else:
                         content = ''
-                        action = None                    
+                        action = None
+                    #//                    
             else:
                 raise ValueError(f"Invalid prediction type: {type(prediction)}")
             
