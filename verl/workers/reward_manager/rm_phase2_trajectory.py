@@ -1,26 +1,30 @@
 """
-rm_phase2.py - Gemini 3 Flash 기반 LLM as Judge Reward Manager
+rm_phase2.py - Gemini 3 Flash 기반 VLM as Judge Reward Manager
 
 =============================================================================
 개요
 =============================================================================
 이 모듈은 GSPO Phase 2 학습을 위한 Reward Manager입니다.
-Gemini 3 Flash를 Judge로 사용하여 Frozen Generator의 <answer> 내용만 평가합니다.
+Gemini 3 Flash VLM을 Judge로 사용하여 모델의 추론 과정 전체를 평가합니다.
 
-기존 추론 경로 전체 평가 버전은 rm_phase2_trajectory.py를 참조하세요.
-
-설계 철학:
-- 이미지 품질 평가: NDCG가 담당 (검색된 이미지 vs 정답 이미지 직접 비교)
-- 답변 품질 평가: LLM Judge가 담당 (다양한 자연어 응답의 의미적 타당성)
-- 추론 과정(<think>, <search>, <bbox>)은 평가하지 않음 (NDCG로 간접 평가)
+기존 구현(rm_phase2_deprecated.py)과의 차이점:
+1. FastAPI 서버 대신 Gemini SDK 직접 호출 (오버헤드 감소)
+2. 최종 답변만이 아닌 추론 과정 전체 평가 (think, search, bbox, answer)
+3. 검색된 이미지 + 정답 이미지 모두를 VLM에 전달
+4. 최적화된 단일 루프 구조 (중복 디코딩 제거)
+5. JSONL 로그 형식 (append 모드로 I/O 효율화)
+6. 비동기 배치 처리 (asyncio + generate_content_async)로 ~9배 성능 향상
 
 =============================================================================
 점수 계산 공식
 =============================================================================
-final_score = 0.8 * judge_score + 0.2 * ndcg_value
+final_score = 0.8 * vlm_score + 0.2 * ndcg_value
 
-- judge_score: Gemini Judge의 이진 판정 (1.0 = True, 0.0 = False)
-  - <answer> 내용과 reference_answer의 의미적 일치 여부
+- vlm_score: Gemini VLM Judge가 평가한 점수 (0.0 ~ 1.0)
+  - visual_claims_score: 이미지 내용과 추론의 일치도
+  - think_answer_consistency: <think>와 <answer>의 일관성
+  - search_efficiency: 검색 쿼리의 효율성
+  - answer_accuracy: 정답과의 일치도
 
 - ndcg_value: 검색된 이미지와 정답 이미지의 NDCG (0.0 ~ 1.0)
 
@@ -46,7 +50,7 @@ final_score = 0.8 * judge_score + 0.2 * ndcg_value
   export GEMINI_API_KEY="your-api-key"
 
 필수 패키지:
-  pip install google-generativeai
+  pip install google-generativeai pillow
 """
 
 # =============================================================================
@@ -62,65 +66,86 @@ import threading
 import queue
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+from PIL import Image
 
 # Gemini SDK
 import google.generativeai as genai
 
 
 # =============================================================================
-# LLM Judge 프롬프트
+# VLM Judge 프롬프트
 # =============================================================================
-# 이 프롬프트는 Gemini에게 전달되어 <answer> 내용만 평가합니다.
-# 기존 LLM as Judge 방식과 동일하게 이미지 없이 텍스트만 평가합니다.
+# 이 프롬프트는 Gemini VLM에게 전달되어 모델의 추론 과정을 평가합니다.
 #
-# 평가 기준:
-#   - 생성된 답변과 정답의 의미적 일치 여부 (semantic equivalence)
-#   - 정확한 문자열 매칭이 아닌, 의미가 동일한지 판단
+# 평가 기준 (우선순위 순):
+#   1. Answer Accuracy: 정답과의 일치도 (가장 중요)
+#   2. Visual Grounding: 이미지 내용과 추론의 일치 여부
+#   3. Reasoning Consistency: 추론과 답변의 논리적 일관성
+#
+# 참고: Search Efficiency는 NDCG로 별도 계산되므로 VLM 평가에서 제외
 
-LLM_JUDGE_PROMPT = """You are an expert evaluation system for a question answering chatbot.
+VLM_JUDGE_PROMPT = """You are an expert evaluator for a visual question answering agent.
+Evaluate the agent's response based on the provided images and reference answer.
 
-You are given the following information:
-- the query
-- a generated answer
-- a reference answer
+## Input
+- Images: {image_description}
+- Query: {query}
+- Agent's Response:
+{full_response}
+- Reference Answer: {reference_answer}
 
-Your task is to evaluate the correctness of the generated answer.
+## Evaluation Criteria (in order of importance)
 
-## Query
-{query}
+### 1. Answer Accuracy (Most Important)
+Does the final answer correctly address the query?
+- Compare with the reference answer
+- Consider semantic equivalence, not just exact match
+- Partial credit for partially correct answers
 
-## Reference Answer
-{reference_answer}
+### 2. Visual Grounding
+Are the claims in the response supported by the actual image content?
+- Check if visual descriptions match what's in the images
+- Penalize fabricated or hallucinated details
 
-## Generated Answer
-{generated_answer}
+### 3. Reasoning Consistency
+Is the reasoning process logically coherent?
+- Does the conclusion follow from the observations?
+- Are there any contradictions in the reasoning?
 
-## Evaluation Guidelines
-- Evaluate if the generated answer is semantically equivalent to the reference answer
-- Consider semantic equivalence, not just exact string match
-- If the core meaning is the same, judge it as correct even if the wording differs
-- Be lenient with minor formatting differences (e.g., "$4.5B" vs "4.5 billion dollars")
-
-## Response
-Respond with whether the generated answer is correct (True) or incorrect (False).
+## Scoring Guidelines
+- Prioritize answer correctness above all else
+- A correct answer with minor reasoning flaws should score higher than incorrect answer with good reasoning
+- Give partial credit when appropriate
 """
 
 # =============================================================================
-# LLM Judge 응답 스키마 (Gemini Structured Output)
+# VLM Judge 응답 스키마 (Gemini Structured Output)
 # =============================================================================
 # Gemini SDK의 response_schema 기능을 사용하여 JSON 응답을 강제합니다.
 # 참고: https://ai.google.dev/gemini-api/docs/structured-output
 
-LLM_RESPONSE_SCHEMA = {
+VLM_RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
-        "is_correct": {
-            "type": "boolean",
-            "description": "Whether the generated answer is semantically correct (True/False)"
+        "answer_accuracy": {
+            "type": "number",
+            "description": "How well the answer matches the reference (0.0-1.0)"
+        },
+        "visual_grounding": {
+            "type": "number",
+            "description": "How well claims are supported by image content (0.0-1.0)"
+        },
+        "reasoning_consistency": {
+            "type": "number",
+            "description": "Logical coherence of the reasoning process (0.0-1.0)"
+        },
+        "final_score": {
+            "type": "number",
+            "description": "Overall score considering all criteria (0.0-1.0)"
         }
     },
-    "required": ["is_correct"]
+    "required": ["answer_accuracy", "visual_grounding", "reasoning_consistency", "final_score"]
 }
 
 
@@ -232,20 +257,20 @@ class PromptRewardResult:
 # =============================================================================
 class RMManager:
     """
-    Gemini 3 Flash 기반 LLM as Judge Reward Manager
+    Gemini 3 Flash 기반 VLM as Judge Reward Manager
 
-    GSPO Phase 2 학습에서 Frozen Generator의 <answer> 내용을 평가하여 보상을 계산합니다.
-    이미지 품질은 NDCG로 별도 평가하며, LLM Judge는 텍스트 답변의 의미적 정확성만 평가합니다.
+    GSPO Phase 2 학습에서 모델의 추론 과정을 평가하여 보상을 계산합니다.
 
     주요 기능:
-    1. 모델 응답에서 <answer> 내용 추출
-    2. Gemini를 통한 텍스트 기반 답변 정확성 평가 (True/False)
+    1. 모델 응답에서 답변 추출 및 디코딩
+    2. Gemini VLM을 통한 추론 과정 평가
     3. NDCG 기반 검색 품질 평가
-    4. 최종 보상 점수 계산: 0.8 * judge + 0.2 * ndcg
+    4. 최종 보상 점수 계산 및 텐서 할당
 
     Attributes:
         tokenizer: 토크나이저 (응답 디코딩용)
         log_path: JSONL 로그 파일 경로
+        image_base_path: 이미지 파일 기본 경로
         gemini: Gemini 모델 인스턴스
     """
 
@@ -268,7 +293,7 @@ class RMManager:
             compute_score: (미사용, 호환성 유지)
             log_path: 학습 로그 저장 경로 (JSONL 형식)
             gemini_model: Gemini 모델 이름
-            image_base_path: 이미지 파일 기본 경로 (NDCG 계산용)
+            image_base_path: 이미지 파일 기본 경로
             max_concurrent_requests: 동시 API 호출 수 제한 (Gemini rate limit 대응)
         """
         self.tokenizer = tokenizer
@@ -294,12 +319,13 @@ class RMManager:
 
         genai.configure(api_key=api_key)
 
-        # Structured Output 설정 (True/False 이진 판정)
+        # Structured Output 설정
         # response_mime_type: JSON 응답 강제
-        # response_schema: is_correct (boolean) 반환
+        # response_schema: 응답 구조 정의
+        # 참고: https://ai.google.dev/gemini-api/docs/structured-output
         self.generation_config = {
             "response_mime_type": "application/json",
-            "response_schema": LLM_RESPONSE_SCHEMA
+            "response_schema": VLM_RESPONSE_SCHEMA
         }
 
         self.gemini = genai.GenerativeModel(
@@ -307,11 +333,11 @@ class RMManager:
             generation_config=self.generation_config
         )
 
-        print(f"[RMManager] Gemini LLM Judge 초기화 완료: {gemini_model}")
-        print(f"[RMManager] 평가 방식: <answer> 텍스트만 평가 (이미지 없음)")
-        print(f"[RMManager] 점수 형식: True/False 이진 판정")
+        print(f"[RMManager] Gemini 모델 초기화 완료: {gemini_model}")
+        print(f"[RMManager] Structured Output 활성화: JSON 스키마 적용")
         print(f"[RMManager] 비동기 배치 처리: 최대 {max_concurrent_requests}개 동시 요청")
         print(f"[RMManager] 로그 경로: {log_path}")
+        print(f"[RMManager] 이미지 경로: {image_base_path}")
 
         # =========================================================================
         # 스트리밍 모드 설정
@@ -404,47 +430,51 @@ class RMManager:
                     for page in extra_info["reference_page"].tolist()
                 ]
 
-            # -----------------------------------------------------------------
-            # 2.5 <answer> 내용 추출 (Frozen Generator 출력)
-            # -----------------------------------------------------------------
-            generated_answer = get_answer_from_predict_str(response_str)
-            if generated_answer is None:
-                generated_answer = "Please Judge False"  # 기존 방식과 동일
+            # 정답 이미지 경로 구성 (VLM 평가용)
+            reference_image_paths = self._build_reference_image_paths(
+                extra_info.get('file_name', ''),
+                extra_info.get('reference_page', [])
+            )
 
             # -----------------------------------------------------------------
-            # 2.6 전처리 결과 저장
+            # 2.5 전처리 결과 저장
             # -----------------------------------------------------------------
             preprocessed.append({
                 'index': i,
-                'response_str': response_str,           # 전체 추론 경로 (로깅용)
-                'generated_answer': generated_answer,   # <answer> 내용만 (평가용)
+                'response_str': response_str,           # 전체 추론 경로
                 'valid_response_length': valid_response_length,
                 'query': extra_info.get('question', ''),
                 'reference_answer': ground_truth,
+                'retrieved_images': retrieved_images,   # VLM용 검색 이미지 경로
+                'reference_image_paths': reference_image_paths,  # VLM용 정답 이미지 경로
                 'retrieved_basenames': retrieved_basenames,      # NDCG용
                 'reference_basenames': reference_basenames,      # NDCG용
             })
 
         # =========================================================================
-        # 3. Gemini LLM Judge 비동기 배치 호출
+        # 3. Gemini VLM Judge 비동기 배치 호출
         # =========================================================================
         # 성능 비교:
         # - 순차 처리: 32개 샘플 × 2초 = 64초
         # - 비동기 처리 (10개 동시): 32 / 10 × 2초 ≈ 7초 (~9배 향상)
-        judge_results = self._run_async_batch_evaluate(preprocessed)
+        vlm_scores = self._run_async_batch_evaluate(preprocessed)
 
         # =========================================================================
         # 4. 점수 계산 및 텐서 할당
         # =========================================================================
         metrics = {
             'ndcg': [],
-            'judge_score': [],      # True=1.0, False=0.0
+            'vlm_score': [],
             'final_score': [],
+            # Structured Output에서 제공하는 세부 점수
+            'answer_accuracy': [],
+            'visual_grounding': [],
+            'reasoning_consistency': [],
         }
         log_entries = []
 
         for i, item in enumerate(preprocessed):
-            judge_result = judge_results[i]
+            vlm_result = vlm_scores[i]
 
             # -----------------------------------------------------------------
             # 4.1 NDCG 계산
@@ -452,38 +482,36 @@ class RMManager:
             ndcg_value = ndcg(item['retrieved_basenames'], item['reference_basenames'])
 
             # -----------------------------------------------------------------
-            # 4.2 Judge 점수: True → 1.0, False → 0.0
+            # 4.2 최종 점수 계산: 0.8 * VLM + 0.2 * NDCG
             # -----------------------------------------------------------------
-            is_correct = judge_result.get('is_correct', False)
-            judge_score = 1.0 if is_correct else 0.0
+            vlm_score = vlm_result.get('final_score', 0.0)
+            final_score = 0.8 * vlm_score + 0.2 * ndcg_value
 
             # -----------------------------------------------------------------
-            # 4.3 최종 점수 계산: 0.8 * Judge + 0.2 * NDCG
-            # -----------------------------------------------------------------
-            final_score = 0.8 * judge_score + 0.2 * ndcg_value
-
-            # -----------------------------------------------------------------
-            # 4.4 reward_tensor에 할당
+            # 4.3 reward_tensor에 할당
             # -----------------------------------------------------------------
             # 마지막 유효 토큰 위치에만 점수 할당 (verl 프레임워크 요구사항)
             reward_tensor[i, item['valid_response_length'] - 1] = final_score
 
             # -----------------------------------------------------------------
-            # 4.5 메트릭 수집
+            # 4.4 메트릭 수집
             # -----------------------------------------------------------------
             metrics['ndcg'].append(ndcg_value)
-            metrics['judge_score'].append(judge_score)
+            metrics['vlm_score'].append(vlm_score)
             metrics['final_score'].append(final_score)
 
+            # 세부 점수 수집 (Structured Output에서 제공)
+            metrics['answer_accuracy'].append(vlm_result.get('answer_accuracy', 0.0))
+            metrics['visual_grounding'].append(vlm_result.get('visual_grounding', 0.0))
+            metrics['reasoning_consistency'].append(vlm_result.get('reasoning_consistency', 0.0))
+
             # -----------------------------------------------------------------
-            # 4.6 로그 엔트리 생성
+            # 4.5 로그 엔트리 생성
             # -----------------------------------------------------------------
             log_entries.append({
                 'query': item['query'],
-                'generated_answer': item['generated_answer'],
-                'reference_answer': item['reference_answer'],
-                'is_correct': is_correct,
-                'judge_score': judge_score,
+                'response': item['response_str'][:1000],  # 로그 크기 제한
+                'vlm_result': vlm_result,
                 'ndcg': ndcg_value,
                 'final_score': final_score,
             })
@@ -504,16 +532,19 @@ class RMManager:
             return sum(lst) / len(lst) if lst else 0.0
 
         avg_metrics = {
+            # 주요 점수
             'reward/ndcg_mean': safe_mean(metrics['ndcg']),
-            'reward/judge_score_mean': safe_mean(metrics['judge_score']),
+            'reward/vlm_score_mean': safe_mean(metrics['vlm_score']),
             'reward/final_score_mean': safe_mean(metrics['final_score']),
-            # 정확도 (True 비율)
-            'reward/accuracy': safe_mean(metrics['judge_score']),
+            # 세부 점수 (Structured Output)
+            'reward/answer_accuracy_mean': safe_mean(metrics['answer_accuracy']),
+            'reward/visual_grounding_mean': safe_mean(metrics['visual_grounding']),
+            'reward/reasoning_consistency_mean': safe_mean(metrics['reasoning_consistency']),
         }
 
         print(f"[RMManager] 배치 처리 완료: {len(preprocessed)}개 샘플")
         print(f"[RMManager] 평균 점수 - NDCG: {avg_metrics['reward/ndcg_mean']:.4f}, "
-              f"Judge: {avg_metrics['reward/judge_score_mean']:.4f}, "
+              f"VLM: {avg_metrics['reward/vlm_score_mean']:.4f}, "
               f"Final: {avg_metrics['reward/final_score_mean']:.4f}")
 
         return reward_tensor, avg_metrics
@@ -621,21 +652,26 @@ class RMManager:
             base_delay: 재시도 기본 대기 시간 (초)
 
         Returns:
-            LLM Judge 평가 결과 딕셔너리 (is_correct: bool)
+            VLM 평가 결과 딕셔너리
         """
         async with semaphore:
-            # 1. LLM 입력 준비 (텍스트 프롬프트만)
-            prompt = self._prepare_llm_input(item)
+            # 1. VLM 입력 준비 (이미지 로드 + 프롬프트 구성)
+            # 이 단계는 재시도 대상이 아님 (로컬 작업)
+            images, prompt = self._prepare_vlm_input(item)
 
-            # 2. Gemini API 호출 (재시도 대상)
+            # 2. 이미지가 없으면 기본값 반환 (재시도 불필요)
+            if not images:
+                return self._default_result('no_images')
+
+            # 3. Gemini API 호출 (재시도 대상)
+            content = images + [prompt]
             last_error = None
 
             for attempt in range(max_retries):
                 try:
-                    # 텍스트만 전송 (이미지 없음)
-                    response = await self.gemini.generate_content_async(prompt)
+                    response = await self.gemini.generate_content_async(content)
                     # 성공 시 즉시 반환
-                    return self._parse_llm_response(response.text)
+                    return self._parse_vlm_response(response.text)
 
                 except Exception as e:
                     last_error = e
@@ -654,33 +690,51 @@ class RMManager:
             # 모든 재시도 실패 시 기본값 반환
             return self._default_result(f"max_retries_exceeded: {last_error}")
 
-    def _prepare_llm_input(self, item: dict) -> str:
+    def _prepare_vlm_input(self, item: dict) -> tuple:
         """
-        LLM Judge 입력 준비 (텍스트 프롬프트만)
+        VLM 입력 준비 (이미지 로드 + 프롬프트 구성)
 
-        이미지 없이 텍스트만 사용하여 <answer> 내용의 정확성을 평가합니다.
-        기존 LLM as Judge 방식과 동일합니다.
+        검색된 이미지와 정답 이미지를 로드하고, VLM Judge 프롬프트를 구성합니다.
 
         Args:
             item: 전처리된 샘플 데이터
 
         Returns:
-            프롬프트 문자열
+            tuple: (이미지 리스트, 프롬프트 문자열)
         """
-        prompt = LLM_JUDGE_PROMPT.format(
+        images = []
+        retrieved_count = 0
+        reference_count = 0
+
+        # 1. 검색된 이미지들 로드
+        for img_path in item['retrieved_images']:
+            if os.path.exists(img_path):
+                images.append(Image.open(img_path))
+                retrieved_count += 1
+
+        # 2. 정답 이미지들 로드
+        for img_path in item.get('reference_image_paths', []):
+            if os.path.exists(img_path):
+                images.append(Image.open(img_path))
+                reference_count += 1
+
+        # 3. 프롬프트 구성
+        image_desc = f"[Retrieved: {retrieved_count}, Reference: {reference_count}]"
+        prompt = VLM_JUDGE_PROMPT.format(
             query=item['query'],
-            generated_answer=item['generated_answer'],  # <answer> 내용만
+            full_response=item['response_str'],  # <think>, <search>, <bbox>, <answer> 포함
             reference_answer=item['reference_answer'],
+            image_description=image_desc,
         )
 
-        return prompt
+        return images, prompt
 
     def _default_result(self, error: str) -> dict:
         """
         기본 결과 (에러 시 반환)
 
-        API 호출 실패 등의 경우에 반환되는 기본값입니다.
-        학습 안정성을 위해 False (오답)를 부여합니다.
+        API 호출 실패나 이미지 없음 등의 경우에 반환되는 기본값입니다.
+        학습 안정성을 위해 0점을 부여합니다.
 
         Args:
             error: 에러 메시지
@@ -689,13 +743,16 @@ class RMManager:
             기본값이 설정된 결과 딕셔너리
         """
         return {
-            'is_correct': False,
+            'answer_accuracy': 0.0,
+            'visual_grounding': 0.0,
+            'reasoning_consistency': 0.0,
+            'final_score': 0.0,
             'error': error
         }
 
-    def _parse_llm_response(self, text: str) -> dict:
+    def _parse_vlm_response(self, text: str) -> dict:
         """
-        LLM Judge 응답 JSON 파싱
+        VLM 응답 JSON 파싱
 
         Gemini Structured Output을 사용하므로 응답이 이미 JSON 형식입니다.
         response_mime_type="application/json" 설정으로 JSON 응답이 보장됩니다.
@@ -706,8 +763,12 @@ class RMManager:
         Returns:
             파싱된 JSON 딕셔너리 또는 기본값
         """
+        # 기본값 정의
         default_response = {
-            'is_correct': False,
+            'answer_accuracy': 0.0,
+            'visual_grounding': 0.0,
+            'reasoning_consistency': 0.0,
+            'final_score': 0.0,
             'parse_error': True
         }
 
@@ -715,15 +776,19 @@ class RMManager:
             # Structured Output 사용 시 응답이 이미 JSON 형식
             result = json.loads(text)
 
+            # 필수 필드 검증 및 기본값 보완
             return {
-                'is_correct': bool(result.get('is_correct', False)),
+                'answer_accuracy': float(result.get('answer_accuracy', 0.0)),
+                'visual_grounding': float(result.get('visual_grounding', 0.0)),
+                'reasoning_consistency': float(result.get('reasoning_consistency', 0.0)),
+                'final_score': float(result.get('final_score', 0.0)),
             }
 
         except json.JSONDecodeError as e:
             print(f"[RMManager] JSON 파싱 실패: {e}")
             return default_response
         except Exception as e:
-            print(f"[RMManager] LLM 응답 파싱 실패: {e}")
+            print(f"[RMManager] VLM 응답 파싱 실패: {e}")
             return default_response
 
     def _build_reference_image_paths(self, file_name: str, reference_pages) -> list:
@@ -833,7 +898,6 @@ class RMManager:
             sample_indices=sample_indices,
             samples_data=samples_data
         )
-        assert self._request_queue is not None, "Queue not initialized"
         self._request_queue.put(request)
 
     def wait_and_get_streaming_rewards(
@@ -859,7 +923,6 @@ class RMManager:
 
         # Queue가 빌 때까지 대기 (모든 요청 처리 완료)
         # join()은 queue가 empty가 될 때까지 blocking
-        assert self._request_queue is not None, "Queue not initialized"
         try:
             self._request_queue.join()
         except Exception as e:
@@ -912,10 +975,6 @@ class RMManager:
 
         try:
             while not self._shutdown_event.is_set():
-                # Queue가 초기화되지 않은 경우 스킵
-                if self._request_queue is None:
-                    continue
-
                 try:
                     # 0.1초 타임아웃으로 종료 신호 확인 가능하게
                     request = self._request_queue.get(timeout=0.1)
@@ -940,8 +999,7 @@ class RMManager:
 
                 finally:
                     # task_done() 호출로 join()이 완료 감지 가능
-                    if self._request_queue is not None:
-                        self._request_queue.task_done()
+                    self._request_queue.task_done()
 
         finally:
             loop.close()
@@ -951,7 +1009,7 @@ class RMManager:
         request: PromptRewardRequest
     ) -> PromptRewardResult:
         """
-        프롬프트의 모든 샘플을 비동기 평가 (LLM as Judge 방식)
+        프롬프트의 모든 샘플을 비동기 평가
 
         기존 _async_evaluate_single 로직을 재사용하되,
         프롬프트 단위로 결과를 묶어서 반환합니다.
@@ -970,15 +1028,18 @@ class RMManager:
         async def evaluate_single(sample_data: Dict, local_idx: int):
             """단일 샘플 평가 (클로저로 semaphore 공유)"""
             async with semaphore:
-                # LLM 입력 준비 (텍스트만, 이미지 없음)
-                prompt = self._prepare_llm_input(sample_data)
+                # 기존 VLM 평가 로직 재사용
+                images, prompt = self._prepare_vlm_input(sample_data)
+
+                if not images:
+                    return local_idx, self._default_result('no_images'), 0.0
 
                 try:
-                    # 텍스트만 전송 (이미지 없음)
-                    response = await self.gemini.generate_content_async(prompt)
-                    judge_result = self._parse_llm_response(response.text)
+                    content = images + [prompt]
+                    response = await self.gemini.generate_content_async(content)
+                    vlm_result = self._parse_vlm_response(response.text)
                 except Exception as e:
-                    judge_result = self._default_result(str(e))
+                    vlm_result = self._default_result(str(e))
 
                 # NDCG 계산
                 ndcg_value = ndcg(
@@ -986,16 +1047,12 @@ class RMManager:
                     sample_data.get('reference_basenames', [])
                 )
 
-                # Judge 점수: True → 1.0, False → 0.0
-                is_correct = judge_result.get('is_correct', False)
-                judge_score = 1.0 if is_correct else 0.0
+                # 최종 점수: 0.8 * VLM + 0.2 * NDCG
+                vlm_score = vlm_result.get('final_score', 0.0)
+                final_score = 0.8 * vlm_score + 0.2 * ndcg_value
+                vlm_result['final_score_combined'] = final_score
 
-                # 최종 점수: 0.8 * Judge + 0.2 * NDCG
-                final_score = 0.8 * judge_score + 0.2 * ndcg_value
-                judge_result['final_score_combined'] = final_score
-                judge_result['judge_score'] = judge_score
-
-                return local_idx, judge_result, ndcg_value
+                return local_idx, vlm_result, ndcg_value
 
         # 모든 샘플에 대해 비동기 태스크 생성
         tasks = [
@@ -1009,25 +1066,24 @@ class RMManager:
         # 결과 정리
         n = len(request.samples_data)
         reward_scores = [0.0] * n
-        judge_results = [{}] * n
+        vlm_results = [{}] * n
         ndcg_values = [0.0] * n
 
         for result in results:
             if isinstance(result, Exception):
                 print(f"[RMManager] 샘플 평가 실패: {result}")
                 continue
-            if isinstance(result, tuple) and len(result) == 3:
-                local_idx, judge, ndcg_val = result
-                # final_score_combined는 0.8*Judge + 0.2*NDCG
-                reward_scores[local_idx] = judge.get('final_score_combined', 0.0)
-                judge_results[local_idx] = judge
-                ndcg_values[local_idx] = ndcg_val
+            local_idx, vlm, ndcg_val = result
+            # final_score_combined는 0.8*VLM + 0.2*NDCG
+            reward_scores[local_idx] = vlm.get('final_score_combined', 0.0)
+            vlm_results[local_idx] = vlm
+            ndcg_values[local_idx] = ndcg_val
 
         return PromptRewardResult(
             uid=request.uid,
             sample_indices=request.sample_indices,
             reward_scores=reward_scores,
-            vlm_results=judge_results,  # 필드명은 호환성을 위해 유지
+            vlm_results=vlm_results,
             ndcg_values=ndcg_values
         )
 
