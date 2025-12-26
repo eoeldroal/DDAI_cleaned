@@ -2,4 +2,5 @@ working_dir: ./
 excludes: ["/.git/"]
 env_vars:
   TORCH_NCCL_AVOID_RECORD_STREAMS: "1"
-  VLLM_ATTENTION_BACKEND: "XFORMERS"
+  # Use PyTorch native SDPA to avoid flash_attn dependency
+  VLLM_ATTENTION_BACKEND: "TORCH_SDPA"

@@ -23,15 +23,28 @@ set -x  # 디버그 모드 (실행 명령어 출력)
 # 1. 환경 설정
 # =============================================================================
 export PYTHONNOUSERSITE=1
+export PYTHONASYNCIODEBUG=1  
+
+export CUDA_VISIBLE_DEVICES=4,5,6,7
 
 # Ray 임시 디렉토리 설정
-mkdir -p ~/sangmin/ray_tmp
-export TMPDIR=~/sangmin/ray_tmp
-export RAY_TMPDIR=~/sangmin/ray_tmp
+mkdir -p ~/eoeldroal/ray_tmp
+export TMPDIR=~/eoeldroal/ray_tmp
+export RAY_TMPDIR=~/eoeldroal/ray_tmp
 
 # WandB 설정
 export WANDB_API_KEY='8d955a8fe09693b7a2e983616a79aae912307d79'
 export WANDB_PROJECT='gspo_phase2_gemini'
+
+# =============================================================================
+# Flash Attention 비활성화 설정
+# =============================================================================
+# vLLM 사용 시 PyTorch 내장 SDPA 사용 (flash_attn 패키지 불필요)
+# export VLLM_ATTENTION_BACKEND=TORCH_SDPA
+# HuggingFace transformers에서 flash_attn 사용 비활성화
+export ATTN_BACKEND=native
+
+export SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK=True
 
 # =============================================================================
 # 2. Gemini API 키 설정 (필수!)
@@ -55,12 +68,24 @@ fi
 echo ">>> Gemini API Key 확인 완료"
 
 # =============================================================================
+# 2-1. DashScope API 키 설정 (Frozen Generator용)
+# =============================================================================
+# 터미널에서 이미 설정된 경우 그대로 사용
+if [ -z "$DASHSCOPE_API_KEY" ]; then
+    echo "WARNING: DASHSCOPE_API_KEY가 설정되지 않았습니다."
+    echo "Frozen Generator (Qwen2.5-VL-72B) 사용 불가"
+else
+    echo ">>> DashScope API Key 확인 완료"
+fi
+export DASHSCOPE_BASE_URL="${DASHSCOPE_BASE_URL:-https://dashscope-intl.aliyuncs.com/api/v1}"
+
+# =============================================================================
 # 3. 모델 및 학습 설정
 # =============================================================================
-ENGINE=${1:-vllm}
+ENGINE=${1:-sglang}
 
 # 모델 경로
-model_path=./RL_results/merged_gspo_phase1
+model_path=/home/eoeldroal/WorkPlace/DDAI_cleaned/RL_results/gspo_phase1
 
 # GPU 설정
 n_gpus=4
@@ -69,11 +94,16 @@ n_gpus=4
 # - train_batch_size: 원본 프롬프트 수
 # - n_agent: 프롬프트당 생성할 응답 수
 # - 실제 배치 크기 = train_batch_size × n_agent = 64 × 8 = 512
-train_batch_size=64
-ppo_mini_batch_size=16
-ppo_micro_batch_size_per_gpu=4
-log_prob_micro_batch_size_per_gpu=8
-n_agent=8
+# train_batch_size=64
+# ppo_mini_batch_size=16
+# ppo_micro_batch_size_per_gpu=1
+# log_prob_micro_batch_size_per_gpu=2
+# n_agent=8
+train_batch_size=4
+ppo_mini_batch_size=4
+ppo_micro_batch_size_per_gpu=1
+log_prob_micro_batch_size_per_gpu=1
+n_agent=2
 
 # 기타 설정
 tensor_model_parallel_size=1
@@ -99,6 +129,23 @@ max_concurrent_requests=50
 # - True: Generation과 Reward를 파이프라인으로 병렬 처리 (약 13% 성능 향상)
 # - False: 기존 배치 모드 (모든 Generation 완료 후 Reward 계산)
 streaming_reward_enable=True
+
+# =============================================================================
+# 4-1. Frozen Generator 설정 (Qwen2.5-VL-72B-Instruct via DashScope)
+# =============================================================================
+# [Phase 5] OpenAI 호환 비동기 API 사용으로 ~10x 성능 향상
+# - 동시 API 요청 수 (rate limit 대응, 기본값: 50)
+frozen_max_concurrent=50
+
+# Frozen Generator 모델명 (DashScope에서 제공하는 모델)
+frozen_model="qwen2.5-vl-72b-instruct"
+
+# 최대 토큰 수 (답변 길이)
+frozen_max_tokens=1024
+
+# 재시도 설정
+frozen_max_retries=5
+frozen_backoff_base=1.5
 
 # =============================================================================
 # 5. Retriever 설정
@@ -127,6 +174,11 @@ echo "배치 크기: $train_batch_size × $n_agent = $((train_batch_size * n_age
 echo "Gemini 모델: $gemini_model"
 echo "동시 요청 수: $max_concurrent_requests"
 echo "스트리밍 Reward: $streaming_reward_enable"
+echo "----------------------------------------"
+echo "[Phase 5] Frozen Generator (OpenAI Async)"
+echo "  모델: $frozen_model"
+echo "  동시 요청 수: $frozen_max_concurrent"
+echo "  최대 토큰: $frozen_max_tokens"
 echo "=========================================="
 
 python3 -m verl.trainer.main_ppo \
@@ -139,10 +191,11 @@ python3 -m verl.trainer.main_ppo \
     data.image_key=images \
     actor_rollout_ref.model.path=$model_path \
     actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.actor.optim.lr_warmup_steps=5 \
-    actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.285 \
-    +actor_rollout_ref.actor.optim.name='adamw_8bit' \
-    actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.actor.optim.lr_warmup_steps=12 \
+    actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.1 \
+    +actor_rollout_ref.actor.optim.name='AdamW' \
+    actor_rollout_ref.model.use_remove_padding=False \
+    +actor_rollout_ref.model.enable_activation_offload=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=$ppo_mini_batch_size \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$ppo_micro_batch_size_per_gpu \
     actor_rollout_ref.actor.use_kl_loss=False \
@@ -155,24 +208,33 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
     actor_rollout_ref.rollout.free_cache_engine=True \
     actor_rollout_ref.actor.state_masking=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$log_prob_micro_batch_size_per_gpu \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$tensor_model_parallel_size \
     actor_rollout_ref.rollout.name=$ENGINE \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
-    actor_rollout_ref.rollout.enable_chunked_prefill=False \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.n=1 \
     actor_rollout_ref.rollout.n_agent=$n_agent \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$log_prob_micro_batch_size_per_gpu \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.actor.use_dynamic_bsz=True \
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
+    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
     reward_model.reward_manager='rm' \
     +reward_model.log_path=$log_path \
     +reward_model.gemini_model=$gemini_model \
     +reward_model.image_base_path=$image_base_path \
     +reward_model.max_concurrent_requests=$max_concurrent_requests \
     +reward_model.streaming_reward.enable=$streaming_reward_enable \
+    +frozen_generator.model=$frozen_model \
+    +frozen_generator.max_tokens=$frozen_max_tokens \
+    +frozen_generator.max_concurrent=$frozen_max_concurrent \
+    +frozen_generator.max_retries=$frozen_max_retries \
+    +frozen_generator.backoff_base=$frozen_backoff_base \
     custom_reward_function.path=./lsm_tmp/simple_format_checker.py \
     custom_reward_function.name=simple_format_checker \
     algorithm.kl_ctrl.kl_coef=0.0 \
@@ -182,7 +244,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name=gspo_phase2_gemini_flash \
     trainer.n_gpus_per_node=$n_gpus \
     trainer.nnodes=1 \
-    trainer.save_freq=10 \
+    trainer.save_freq=30 \
     trainer.test_freq=1000000 \
     trainer.total_epochs=1 \
     trainer.resume_mode=auto \
