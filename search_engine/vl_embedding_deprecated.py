@@ -1,12 +1,3 @@
-"""
-VL_Embedding - GPU 최적화 버전
-
-최적화 사항:
-1. device 파라미터 추가 (GPU 지정 가능)
-2. 기존 인터페이스와 100% 호환
-
-기존 버전: vl_embedding_deprecated.py
-"""
 import asyncio
 from typing import Any, List, Optional, Union
 import torch
@@ -28,7 +19,6 @@ def weighted_mean_pooling(hidden, attention_mask):
     d = attention_mask_.sum(dim=1, keepdim=True).float()
     reps = s / d
     return reps
-
 
 class VL_Embedding(MultiModalEmbedding):
 
@@ -58,7 +48,7 @@ class VL_Embedding(MultiModalEmbedding):
         default=False,
         description="Whether to show progress bars.",
     )
-
+    
     embed_model: Union[ColQwen2, AutoModel, None] = Field(
         default=None
     )
@@ -68,8 +58,8 @@ class VL_Embedding(MultiModalEmbedding):
     tokenizer: Optional[AutoTokenizer] = Field(
         default=None
     )
-
-
+    
+    
     def __init__(
         self,
         model: str = "vidore/colqwen2-v1.0",
@@ -77,7 +67,6 @@ class VL_Embedding(MultiModalEmbedding):
         timeout: Optional[int] = None,
         callback_manager: Optional[CallbackManager] = None,
         mode: str = 'text',
-        device: Optional[str] = None,  # [NEW] GPU 지정 가능
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -87,41 +76,38 @@ class VL_Embedding(MultiModalEmbedding):
             callback_manager=callback_manager,
             **kwargs,
         )
-
+        
         self.mode = mode
-
-        # [NEW] device 파라미터 처리
-        # 기존 호환성: device가 None이면 기존 기본값 'cuda:2' 사용
-        if device is None:
-            device = 'cuda:2'
-
+        
         if 'openbmb' in model:
             self.tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
             self.embed_model = AutoModel.from_pretrained(model,
              torch_dtype=torch.bfloat16,
             trust_remote_code=True,
-            device_map=device).cuda().eval()
+            device_map='cuda:2').cuda().eval() #0 ->2 수정
+            # self.embed_model.eval()
         elif 'vidore' in model and 'qwen' in model:
             self.embed_model = ColQwen2.from_pretrained(
                 model,
                 torch_dtype=torch.bfloat16,
-                device_map=device,  # [NEW] 지정된 GPU 사용
+                device_map='cuda:2',  # or "mps" if on Apple Silicon 수정
             ).eval()
             self.processor = ColQwen2Processor.from_pretrained(model)
         elif 'vidore' in model and 'pali' in model:
             self.embed_model = ColPali.from_pretrained(
                 model,
                 torch_dtype=torch.bfloat16,
-                device_map=device,  # [NEW] 지정된 GPU 사용
+                device_map='cuda',  # or "mps" if on Apple Silicon
             ).eval()
             self.processor = ColPaliProcessor.from_pretrained(model)
-
+        
+        
 
 
     @classmethod
     def class_name(cls) -> str:
         return "VL_Embedding"
-
+    
     def embed_img(self, img_path):
         if isinstance(img_path, str):
             img_path = [img_path]
@@ -141,10 +127,12 @@ class VL_Embedding(MultiModalEmbedding):
                 outputs = self.embed_model(**inputs)
                 attention_mask = outputs.attention_mask
                 hidden = outputs.last_hidden_state
-                reps = weighted_mean_pooling(hidden, attention_mask)
+                reps = weighted_mean_pooling(hidden, attention_mask)   
                 image_embeddings = F.normalize(reps, p=2, dim=1).detach().cpu().numpy()
+                # image_embeddings = F.normalize(reps, p=2, dim=1).detach().cpu().tolist()[0]
+            # image_embeddings = embeddings.tolist()[0]
         return image_embeddings
-
+    
     def embed_text(self, text):
         if isinstance(text, str):
             text = [text]
@@ -168,8 +156,10 @@ class VL_Embedding(MultiModalEmbedding):
                 outputs = self.embed_model(**inputs)
                 attention_mask = outputs.attention_mask
                 hidden = outputs.last_hidden_state
-                reps = weighted_mean_pooling(hidden, attention_mask)
+                reps = weighted_mean_pooling(hidden, attention_mask)   
+                # query_embeddings = F.normalize(reps, p=2, dim=1).detach().cpu().numpy()
                 query_embeddings = F.normalize(reps, p=2, dim=1).detach().cpu().tolist()
+                # query_embeddings = embeddings.tolist()[0]
         return query_embeddings
 
     def _get_query_embedding(self, query: str) -> List[float]:
@@ -192,17 +182,17 @@ class VL_Embedding(MultiModalEmbedding):
     def _aget_query_embedding(self, query: str) -> List[float]:
         """Get query embedding."""
         return self.embed_text(query)[0]
-
+    
     def _aget_text_embedding(self, text: str) -> List[float]:
         """Get text embedding."""
         return self.embed_text(text)[0]
-
+    
     def _get_image_embedding(self, img_file_path) -> Embedding:
         return self.embed_img(img_file_path)
-
+    
     def _aget_image_embedding(self, img_file_path) -> Embedding:
         return self.embed_img(img_file_path)
-
+    
     def __call__(self, nodes, **kwargs):
         if 'vidore' in self.model:
             if self.mode == 'image':
@@ -214,19 +204,21 @@ class VL_Embedding(MultiModalEmbedding):
 
             for node, embedding in zip(nodes, embeddings):
                 node.embedding = embedding
-
+                
         elif 'openbmb' in self.model:
             if self.mode == 'image':
                 embeddings = self.embed_img([node.metadata['file_path'] for node in nodes])
                 embeddings = embeddings.tolist()
             else:
                 embeddings = self.embed_text([node.text for node in nodes])
+                # embeddings = embeddings.tolist()
+                # embeddings = [embeddings]
 
             for node, embedding in zip(nodes, embeddings):
                 node.embedding = embedding
-
+                
         return nodes
-
+    
     def score(self,image_embeddings,text_embeddings):
         if 'vidore' in self.model:
             score = self.processor.score_multi_vector(image_embeddings, text_embeddings)
@@ -235,8 +227,7 @@ class VL_Embedding(MultiModalEmbedding):
         return score
 
 if __name__ == "__main__":
-    # 테스트 (GPU 지정 가능)
-    colpali = VL_Embedding("vidore/colqwen2-v1.0", device='cuda:2')
+    colpali = VL_Embedding("vidore/colqwen2-v1.0")
     image_embeddings = colpali.embed_img("./search_engine/corpus/img/hello_world.jpg")
     text_embeddings = colpali.embed_text("Hello, world!")
     score = colpali.processor.score_multi_vector(image_embeddings, text_embeddings)
