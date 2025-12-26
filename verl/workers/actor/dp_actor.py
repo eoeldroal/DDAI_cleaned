@@ -36,7 +36,7 @@ from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_u
 from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
 import verl.utils.torch_functional as verl_F
 
-from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
+# from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
 
 __all__ = ['DataParallelPPOActor']
 
@@ -202,6 +202,7 @@ class DataParallelPPOActor(BasePPOActor):
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = 'multi_modal_inputs' in data.non_tensor_batch.keys()
 
+        indices = None
         if has_multi_modal_inputs:
             num_micro_batches = data.batch.batch_size[0] // micro_batch_size
             non_tensor_select_keys = ['multi_modal_inputs']
@@ -223,7 +224,7 @@ class DataParallelPPOActor(BasePPOActor):
             log_probs_lst.append(log_probs)
         log_probs = torch.concat(log_probs_lst, dim=0)
 
-        if use_dynamic_bsz:
+        if use_dynamic_bsz and indices is not None:
             indices = list(itertools.chain.from_iterable(indices))
             assert len(indices) == log_probs.size(0), f"{len(indices)} vs. {log_probs.size()}"
             revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)

@@ -154,7 +154,16 @@ class TaskRunner:
 
         compute_score = get_custom_reward_fn(config)
         if config.reward_model.get("reward_manager", "naive") == 'rm':
-            reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=0, compute_score=compute_score,rm_url=config.reward_model.get("rm_url", "http://0.0.0.0:8003/eval"))
+            # rm_phase2.py uses Gemini API directly, so pass Gemini-specific parameters
+            reward_fn = reward_manager_cls(
+                tokenizer=tokenizer,
+                num_examine=0,
+                compute_score=compute_score,
+                log_path=config.reward_model.get("log_path", "./logs/grpo_log.jsonl"),
+                gemini_model=config.reward_model.get("gemini_model", "gemini-3-flash-preview"),
+                image_base_path=config.reward_model.get("image_base_path", "./data/images"),
+                max_concurrent_requests=config.reward_model.get("max_concurrent_requests", 50),
+            )
         else:
             reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=0, compute_score=compute_score)
         

@@ -19,8 +19,9 @@ Gemini 3 Flash를 Judge로 사용하여 Frozen Generator의 <answer> 내용만 �
 =============================================================================
 final_score = 0.8 * judge_score + 0.2 * ndcg_value
 
-- judge_score: Gemini Judge의 이진 판정 (1.0 = True, 0.0 = False)
-  - <answer> 내용과 reference_answer의 의미적 일치 여부
+- judge_score: Gemini Judge의 연속 점수 (0.0 ~ 1.0)
+  - <answer> 내용과 reference_answer의 의미적 일치 정도
+  - 연속 점수로 분산 감소 및 dense signal 제공
 
 - ndcg_value: 검색된 이미지와 정답 이미지의 NDCG (0.0 ~ 1.0)
 
@@ -102,8 +103,11 @@ Your task is to evaluate the correctness of the generated answer.
 - If the core meaning is the same, judge it as correct even if the wording differs
 - Be lenient with minor formatting differences (e.g., "$4.5B" vs "4.5 billion dollars")
 
-## Response
-Respond with whether the generated answer is correct (True) or incorrect (False).
+## Scoring
+Provide a score from 0.0 to 1.0:
+- 1.0: Semantically equivalent (correct)
+- 0.5-0.9: Partially correct
+- 0.0: Incorrect or unrelated
 """
 
 # =============================================================================
@@ -115,12 +119,12 @@ Respond with whether the generated answer is correct (True) or incorrect (False)
 LLM_RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
-        "is_correct": {
-            "type": "boolean",
-            "description": "Whether the generated answer is semantically correct (True/False)"
+        "score": {
+            "type": "number",
+            "description": "Semantic correctness score from 0.0 (completely wrong) to 1.0 (perfectly correct)"
         }
     },
-    "required": ["is_correct"]
+    "required": ["score"]
 }
 
 
@@ -309,7 +313,7 @@ class RMManager:
 
         print(f"[RMManager] Gemini LLM Judge 초기화 완료: {gemini_model}")
         print(f"[RMManager] 평가 방식: <answer> 텍스트만 평가 (이미지 없음)")
-        print(f"[RMManager] 점수 형식: True/False 이진 판정")
+        print(f"[RMManager] 점수 형식: 연속 점수 (0.0 ~ 1.0)")
         print(f"[RMManager] 비동기 배치 처리: 최대 {max_concurrent_requests}개 동시 요청")
         print(f"[RMManager] 로그 경로: {log_path}")
 
@@ -452,10 +456,9 @@ class RMManager:
             ndcg_value = ndcg(item['retrieved_basenames'], item['reference_basenames'])
 
             # -----------------------------------------------------------------
-            # 4.2 Judge 점수: True → 1.0, False → 0.0
+            # 4.2 Judge 점수: 연속 점수 (0.0 ~ 1.0) 직접 사용
             # -----------------------------------------------------------------
-            is_correct = judge_result.get('is_correct', False)
-            judge_score = 1.0 if is_correct else 0.0
+            judge_score = judge_result.get('score', 0.0)
 
             # -----------------------------------------------------------------
             # 4.3 최종 점수 계산: 0.8 * Judge + 0.2 * NDCG
@@ -482,7 +485,6 @@ class RMManager:
                 'query': item['query'],
                 'generated_answer': item['generated_answer'],
                 'reference_answer': item['reference_answer'],
-                'is_correct': is_correct,
                 'judge_score': judge_score,
                 'ndcg': ndcg_value,
                 'final_score': final_score,
@@ -507,8 +509,6 @@ class RMManager:
             'reward/ndcg_mean': safe_mean(metrics['ndcg']),
             'reward/judge_score_mean': safe_mean(metrics['judge_score']),
             'reward/final_score_mean': safe_mean(metrics['final_score']),
-            # 정확도 (True 비율)
-            'reward/accuracy': safe_mean(metrics['judge_score']),
         }
 
         print(f"[RMManager] 배치 처리 완료: {len(preprocessed)}개 샘플")
@@ -680,7 +680,7 @@ class RMManager:
         기본 결과 (에러 시 반환)
 
         API 호출 실패 등의 경우에 반환되는 기본값입니다.
-        학습 안정성을 위해 False (오답)를 부여합니다.
+        학습 안정성을 위해 0.0점을 부여합니다.
 
         Args:
             error: 에러 메시지
@@ -689,7 +689,7 @@ class RMManager:
             기본값이 설정된 결과 딕셔너리
         """
         return {
-            'is_correct': False,
+            'score': 0.0,
             'error': error
         }
 
@@ -705,9 +705,10 @@ class RMManager:
 
         Returns:
             파싱된 JSON 딕셔너리 또는 기본값
+            - score: float (0.0 ~ 1.0)
         """
         default_response = {
-            'is_correct': False,
+            'score': 0.0,
             'parse_error': True
         }
 
@@ -715,8 +716,12 @@ class RMManager:
             # Structured Output 사용 시 응답이 이미 JSON 형식
             result = json.loads(text)
 
+            # score 추출 및 범위 클리핑 (0.0 ~ 1.0)
+            raw_score = result.get('score', 0.0)
+            score = max(0.0, min(1.0, float(raw_score)))
+
             return {
-                'is_correct': bool(result.get('is_correct', False)),
+                'score': score,
             }
 
         except json.JSONDecodeError as e:
@@ -986,9 +991,8 @@ class RMManager:
                     sample_data.get('reference_basenames', [])
                 )
 
-                # Judge 점수: True → 1.0, False → 0.0
-                is_correct = judge_result.get('is_correct', False)
-                judge_score = 1.0 if is_correct else 0.0
+                # Judge 점수: 연속 점수 (0.0 ~ 1.0) 직접 사용
+                judge_score = judge_result.get('score', 0.0)
 
                 # 최종 점수: 0.8 * Judge + 0.2 * NDCG
                 final_score = 0.8 * judge_score + 0.2 * ndcg_value

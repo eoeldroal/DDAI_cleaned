@@ -857,11 +857,19 @@ class RayPPOTrainer(object):
         last_val_metrics = None
 
         # Agent config preparation
+        # [Phase 5] Frozen Generator 비동기 설정 지원
+        frozen_config = getattr(self.config, 'frozen_generator', None) or {}
         gen_config = GenerationConfig(
             max_turns=self.config.max_turns,
             max_prompt_length=99999,
             num_gpus=self.config.trainer.n_gpus_per_node,
             search_url = self.config.retriever.url,
+            # [Phase 5] Frozen Generator 설정 (기본값은 GenerationConfig에서 제공)
+            frozen_model=getattr(frozen_config, 'model', None) or "qwen2.5-vl-72b-instruct",
+            frozen_max_tokens=getattr(frozen_config, 'max_tokens', None) or 1024,
+            frozen_max_concurrent=getattr(frozen_config, 'max_concurrent', None) or 50,
+            frozen_max_retries=getattr(frozen_config, 'max_retries', None) or 3,
+            frozen_backoff_base=getattr(frozen_config, 'backoff_base', None) or 1.5,
         )
 
         generation_manager = LLMGenerationManager(

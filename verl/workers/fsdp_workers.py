@@ -218,13 +218,15 @@ class ActorRolloutRefWorker(Worker):
             else:
                 actor_module_class = AutoModelForCausalLM
 
-            print(f"[HPT][FSDP] _build_model_optimizer START role={role}, path={local_path}", flush=True) #수정 디버깅
+            # Get attn_implementation from config (default: 'eager' to avoid flash_attn dependency)
+            attn_impl = self.config.model.get('attn_implementation', 'eager')
+            print(f"[HPT][FSDP] _build_model_optimizer START role={role}, path={local_path}, attn_impl={attn_impl}", flush=True)
             actor_module = actor_module_class.from_pretrained(pretrained_model_name_or_path=local_path,
                                                               torch_dtype=torch_dtype,
                                                               config=actor_model_config,
-                                                              attn_implementation='flash_attention_2',
+                                                              attn_implementation=attn_impl,
                                                               trust_remote_code=trust_remote_code)
-            print(f"[HPT][FSDP] _build_model_optimizer END role={role}", flush=True) #수정 디버깅
+            print(f"[HPT][FSDP] _build_model_optimizer END role={role}", flush=True)
             
             # Apply Liger kernel to the model if use_liger is set to True
             if use_liger:
@@ -769,10 +771,12 @@ class CriticWorker(Worker):
             warnings.simplefilter("ignore")
             setattr(critic_model_config, 'classifier_dropout', 0.)
             setattr(critic_model_config, 'hidden_dropout', '0')
+            # Get attn_implementation from config (default: 'eager' to avoid flash_attn dependency)
+            attn_impl = self.config.model.get('attn_implementation', 'eager')
             critic_module = AutoModelForTokenClassification.from_pretrained(pretrained_model_name_or_path=local_path,
                                                                             torch_dtype=torch_dtype,
                                                                             config=critic_model_config,
-                                                                            attn_implementation='flash_attention_2',
+                                                                            attn_implementation=attn_impl,
                                                                             trust_remote_code=trust_remote_code)
 
             # some parameters may not in torch_dtype
@@ -1030,10 +1034,12 @@ class RewardModelWorker(Worker):
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
             setattr(model_config, 'classifier_dropout', 0.)
+            # Get attn_implementation from config (default: 'eager' to avoid flash_attn dependency)
+            attn_impl = self.config.model.get('attn_implementation', 'eager')
             reward_module = AutoModelForTokenClassification.from_pretrained(pretrained_model_name_or_path=local_path,
                                                                             config=model_config,
                                                                             torch_dtype=torch.bfloat16,
-                                                                            attn_implementation='flash_attention_2',
+                                                                            attn_implementation=attn_impl,
                                                                             trust_remote_code=trust_remote_code)
             reward_module.to(torch.bfloat16)
         auto_wrap_policy = get_fsdp_wrap_policy(module=reward_module, config=self.config.model.fsdp_config)

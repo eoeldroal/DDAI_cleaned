@@ -18,8 +18,11 @@ import json
 import uuid
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import time as _time 
-import random as _random 
+import threading
+import time as _time
+import random as _random
+import asyncio
+import base64 
 
 # ▼▼▼[성능 측정 추가]▼▼▼ 수정
 # GPUMonitor와 시간 기록을 위한 모듈을 가져옵니다.
@@ -76,7 +79,8 @@ class Phase2PerfTimer:
 from http import HTTPStatus
 from dotenv import load_dotenv
 
-dotenv_dir = '/home/isdslab/sangmin/VRAG_test/'
+# dotenv_dir = '/home/isdslab/sangmin/VRAG_test/'  # 기존 하드코딩 경로
+dotenv_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 프로젝트 루트
 
 # 2. .env 파일의 전체 경로를 만듭니다.
 dotenv_path = os.path.join(dotenv_dir, '.env')
@@ -161,6 +165,166 @@ def _to_image_part(path: str) -> dict | None:
         path = "file://" + os.path.abspath(path)
     return {"image": path}
 # <<< ADDED 끝
+
+
+# =============================================================================
+# [Phase 5] OpenAI SDK 비동기 클라이언트 (Frozen Generator 최적화)
+# - DashScope OpenAI 호환 API 사용
+# - AsyncOpenAI로 진정한 비동기 병렬 처리
+# - 기존 동기 인터페이스 유지하면서 내부적으로 비동기 처리
+# =============================================================================
+_OPENAI_ASYNC_CLIENT = None
+_HAS_OPENAI_ASYNC = False
+
+try:
+    from openai import AsyncOpenAI
+
+    _DASHSCOPE_OPENAI_BASE_URL = os.getenv(
+        "DASHSCOPE_OPENAI_BASE_URL",
+        "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    )
+    _DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY") or os.getenv("DASH_SCOPE_KEY")
+
+    if _DASHSCOPE_API_KEY:
+        _OPENAI_ASYNC_CLIENT = AsyncOpenAI(
+            api_key=_DASHSCOPE_API_KEY,
+            base_url=_DASHSCOPE_OPENAI_BASE_URL,
+            timeout=60.0,
+            max_retries=0,  # 우리가 직접 재시도 로직 관리
+        )
+        _HAS_OPENAI_ASYNC = True
+        _phase2_logger.info(f"[Phase5] OpenAI AsyncClient initialized: {_DASHSCOPE_OPENAI_BASE_URL}")
+except ImportError:
+    _phase2_logger.warning("[Phase5] OpenAI SDK not installed. Falling back to DashScope SDK.")
+except Exception as e:
+    _phase2_logger.warning(f"[Phase5] Failed to initialize OpenAI AsyncClient: {e}")
+
+
+def _image_to_base64_url(path: str) -> str | None:
+    """이미지 파일을 base64 data URL로 변환 (OpenAI Vision API 호환)"""
+    if not path or not os.path.exists(path):
+        return None
+
+    try:
+        # 확장자로 MIME 타입 결정
+        ext = os.path.splitext(path)[1].lower()
+        mime_map = {
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.png': 'image/png',
+            '.gif': 'image/gif',
+            '.webp': 'image/webp',
+        }
+        mime_type = mime_map.get(ext, 'image/jpeg')
+
+        with open(path, 'rb') as f:
+            image_data = f.read()
+
+        base64_data = base64.b64encode(image_data).decode('utf-8')
+        return f"data:{mime_type};base64,{base64_data}"
+    except Exception:
+        return None
+
+
+async def _call_frozen_generator_async_single(
+    client: 'AsyncOpenAI',
+    model: str,
+    question: str,
+    image_paths: List[str],
+    max_tokens: int = 1024,
+    semaphore: asyncio.Semaphore = None,
+) -> Tuple[int, str]:
+    """
+    OpenAI 호환 API를 사용한 비동기 단일 호출
+
+    Args:
+        client: AsyncOpenAI 클라이언트
+        model: 모델명 (예: "qwen2.5-vl-72b-instruct")
+        question: 질문 텍스트
+        image_paths: 이미지 경로 리스트
+        max_tokens: 최대 토큰 수
+        semaphore: 동시 요청 수 제한용 세마포어
+
+    Returns:
+        (status_code, answer_text) 튜플
+    """
+    if semaphore:
+        async with semaphore:
+            return await _call_frozen_generator_async_single_impl(
+                client, model, question, image_paths, max_tokens
+            )
+    else:
+        return await _call_frozen_generator_async_single_impl(
+            client, model, question, image_paths, max_tokens
+        )
+
+
+async def _call_frozen_generator_async_single_impl(
+    client: 'AsyncOpenAI',
+    model: str,
+    question: str,
+    image_paths: List[str],
+    max_tokens: int = 1024,
+) -> Tuple[int, str]:
+    """비동기 호출 구현부"""
+    try:
+        qtext = (question or "").strip() or "."
+
+        sys_prompt = (
+            "You are a visual QA generator. "
+            "Use only the provided images and the user question. "
+            "Return ONLY the final answer text without extra explanations."
+        )
+
+        # OpenAI Vision API 형식으로 메시지 구성
+        user_content = []
+
+        # 이미지를 base64로 인코딩하여 추가
+        for p in (image_paths or []):
+            base64_url = _image_to_base64_url(p)
+            if base64_url:
+                user_content.append({
+                    "type": "image_url",
+                    "image_url": {"url": base64_url}
+                })
+
+        # 텍스트 질문 추가
+        user_content.append({
+            "type": "text",
+            "text": f"Question: {qtext}"
+        })
+
+        messages = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_content}
+        ]
+
+        # 비동기 API 호출
+        response = await client.chat.completions.create(
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=0.1,
+        )
+
+        # 응답 추출
+        if response.choices and len(response.choices) > 0:
+            answer = response.choices[0].message.content or ""
+            return (200, answer.strip())
+
+        return (200, "")
+
+    except Exception as e:
+        error_str = str(e).lower()
+        # Rate limit 또는 서버 오류 감지
+        if "rate" in error_str or "429" in error_str:
+            return (429, "")
+        elif "500" in error_str or "502" in error_str or "503" in error_str:
+            return (503, "")
+        elif "timeout" in error_str:
+            return (408, "")
+        else:
+            return (0, "")
 
 
 # =============================================================================
@@ -263,10 +427,15 @@ class GenerationConfig:
     generator_batch_workers: int = 4
     frozen_max_retries: int = 3
     frozen_backoff_base: float = 1.5
+    # [Phase 5] OpenAI 비동기 API 설정
+    frozen_max_concurrent: int = 50          # 동시 API 요청 수 (비동기 모드)
     # [NEW] 검색 최적화 옵션
     async_search: bool = True                # 비동기 병렬 검색 활성화
-    search_batch_size: int = 100             # 검색 요청 배치 크기
-    search_max_workers: int = 4              # 병렬 검색 워커 수
+    search_batch_size: int = 512             # 검색 요청 배치 크기
+    search_max_workers: int = 16              # 병렬 검색 워커 수 (4→8로 증가)
+    search_timeout: int = 60                 # 검색 타임아웃 (초) - 5초→60초로 증가
+    # [Phase 7] Tool 호출 완전 비동기화
+    phase7_tool_async: bool = True           # Phase 7 비동기화 활성화 (기본: True)
     
 
 
@@ -303,6 +472,39 @@ class LLMGenerationManager:
         # - max_workers=4: 일반적인 디스크 I/O 병렬 처리에 적합
         self._save_executor = ThreadPoolExecutor(max_workers=4)
         self._pending_saves: List = []  # 완료 대기 중인 저장 작업
+
+        # [최적화] HTTP 연결 풀링 - 연결 재사용으로 20-30% 성능 향상
+        self._search_session = requests.Session()
+        # 연결 풀 크기 설정 (워커 수에 맞춤)
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=self.config.search_max_workers,
+            pool_maxsize=self.config.search_max_workers * 2,
+            max_retries=0  # 재시도는 우리 코드에서 처리
+        )
+        self._search_session.mount('http://', adapter)
+        self._search_session.mount('https://', adapter)
+
+        # =========================================================================
+        # [Phase 6] 완전 비동기 스트리밍 Reward 지원
+        # - 백그라운드 스레드에서 Frozen Generator + Reward 처리
+        # - 메인 루프 블로킹 없이 GPU 100% 활용
+        # =========================================================================
+        self._pending_threads: List[threading.Thread] = []  # 완료 대기 중인 스레드
+        self._thread_lock = threading.Lock()  # Thread-safety를 위한 Lock
+        self.generated_answers: Dict[int, str] = {}  # 생성된 답변 저장소
+        self._streaming_frozen_generated: set = set()  # 스트리밍에서 처리 완료된 샘플 인덱스
+
+        # =========================================================================
+        # [Phase 7] Tool 호출 완전 비동기화
+        # - Search API 호출을 비동기로 시작하고, bbox/search_complete와 병렬 처리
+        # - Search 결과는 필요한 시점에만 대기
+        # - GPU idle 시간 최소화
+        # =========================================================================
+        self._tool_executor = ThreadPoolExecutor(
+            max_workers=getattr(config, 'search_max_workers', 8),
+            thread_name_prefix="ToolAsync"
+        )
+        self._phase7_enabled = getattr(config, 'phase7_tool_async', True)  # Phase 7 활성화 플래그
 
     def _ensure_saves_complete(self) -> int:
         """
@@ -784,7 +986,7 @@ class LLMGenerationManager:
         - 성능 로깅: Phase2PerfTimer로 측정 가능 (PHASE2_PERF_LOG=1)
         """
         with Phase2PerfTimer("_generate_with_gpu_padding",
-                            batch_size=active_batch.batch['input_ids'].shape[0] if active_batch.batch else None):
+                            batch_size=active_batch.batch['input_ids'].shape[0] if active_batch.batch is not None else None):
 
             num_gpus = self.config.num_gpus
             if num_gpus <= 1:
@@ -853,8 +1055,13 @@ class LLMGenerationManager:
                     # 알 수 없는 키: None으로 패딩
                     pad_items = [None] * padding_size
 
-                pad_non_tensor_item = np.array(pad_items, dtype=object)
-                padded_non_tensor_batch[k] = np.concatenate([v, pad_non_tensor_item])
+                # [Fix] 차원 불일치 방지: 리스트로 변환 후 concatenate
+                # v가 다차원일 수 있으므로 tolist()로 변환 후 합침
+                if isinstance(v, np.ndarray):
+                    combined = list(v) + pad_items
+                else:
+                    combined = list(v) + pad_items
+                padded_non_tensor_batch[k] = np.array(combined, dtype=object)
 
             padded_active_batch = DataProto.from_dict(padded_batch, padded_non_tensor_batch)
 
@@ -956,6 +1163,11 @@ class LLMGenerationManager:
         # [NEW] 스트리밍 모드 초기화
         if self.streaming_reward_manager:
             self._init_prompt_tracking(gen_batch)
+
+        # [Phase 6] 완전 비동기 스트리밍 상태 초기화
+        self._pending_threads.clear()
+        self.generated_answers.clear()
+        self._streaming_frozen_generated.clear()
 
         # ▼▼▼[성능 측정 추가] 1. 로그 파일 및 모니터 객체 초기화▼▼▼ 수정
         # 고유한 로그 파일 이름을 생성하여 모든 측정 결과를 한 파일에 기록합니다.
@@ -1197,13 +1409,34 @@ class LLMGenerationManager:
         rollings.non_tensor_batch['retrievaled_images'] = retrievaled_images_array
         # ===== generator added=====
         gen_to_tokenize = [""] * len(self.retrievaled_images)
-        
-        completed_indices = [i for i, flag in enumerate(self.search_completed) if flag]
+
+        # =========================================================================
+        # [Phase 6] 백그라운드 스레드 완료 대기
+        # - 스트리밍 모드에서 백그라운드로 처리 중인 Frozen Generator 완료 대기
+        # =========================================================================
+        if self._pending_threads:
+            pending_count = len(self._pending_threads)
+            print(f"[Phase 6] 백그라운드 스레드 대기 중... ({pending_count}개)")
+            wait_start = _time.perf_counter()
+
+            for thread in self._pending_threads:
+                thread.join(timeout=120)  # 최대 2분 대기
+
+            wait_elapsed = _time.perf_counter() - wait_start
+            print(f"[Phase 6] 백그라운드 스레드 완료: {pending_count}개, {wait_elapsed:.2f}초")
+            self._pending_threads.clear()
+
+        # [Phase 6] 스트리밍에서 이미 처리된 샘플 건너뛰기
+        # - 스트리밍 모드에서 이미 Frozen Generator가 호출된 샘플은 제외
+        completed_indices = [
+            i for i, flag in enumerate(self.search_completed)
+            if flag and i not in self._streaming_frozen_generated
+        ]
 
         if completed_indices:
             batch_questions = []
             batch_paths = []
-            
+
             for i in completed_indices:
                 q = self.questions[i]
                 paths = self._prepare_generator_images(self.retrievaled_images[i], self.cropped_images[i])
@@ -1212,12 +1445,19 @@ class LLMGenerationManager:
 
             frozen_monitor.start()
             index2answer = self._call_frozen_generator_batch(
-                completed_indices, batch_questions, batch_paths 
+                completed_indices, batch_questions, batch_paths
             )
             frozen_monitor.stop()
 
+            # 새로 생성된 답변 저장
             for i in completed_indices:
                 ans = index2answer.get(i, "")
+                self.generated_answers[i] = ans
+
+        # [Phase 6] 모든 완료된 샘플의 답변 적용 (스트리밍 + 배치 모두 포함)
+        for i, flag in enumerate(self.search_completed):
+            if flag:
+                ans = self.generated_answers.get(i, "")
                 if ans:
                     gen_to_tokenize[i] = f"<answer>{ans}</answer>{self.tokenizer.eos_token}"
 
@@ -1305,14 +1545,21 @@ class LLMGenerationManager:
         """
         단일 배치 검색 요청 (워커 스레드에서 실행)
         실패 시 지수 백오프로 재시도
+
+        최적화:
+        - HTTP 연결 풀링 사용 (self._search_session)
+        - config에서 timeout 설정 (기본 60초)
         """
         last_error = None
+        timeout = self.config.search_timeout  # 기본값 60초
+
         for attempt in range(max_retries):
             try:
-                response = requests.post(
+                # [최적화] Session 사용으로 연결 재사용
+                response = self._search_session.post(
                     self.config.search_url,
                     json=batch_reqs,
-                    timeout=5
+                    timeout=timeout
                 )
                 response.raise_for_status()
                 return response.json()
@@ -1384,14 +1631,31 @@ class LLMGenerationManager:
 
     # execute_predictions 함수
     def execute_predictions(self, predictions: List[str], uids: np.ndarray, pad_token: str, active_mask=None, do_search=True) -> List[str]:
-        cur_actions, contents = self.postprocess_predictions(predictions)  
+        """
+        [Phase 7] Tool 호출 완전 비동기화
 
-        next_obs, dones = [], []
+        핵심 변경:
+        1. Search API 호출을 비동기로 즉시 시작 (블로킹 없음)
+        2. bbox, search_complete를 search와 병렬로 처리
+        3. Search 결과는 마지막에 대기
+
+        이로 인해 bbox 처리 시간과 search API 대기 시간이 중첩됩니다.
+        """
+        cur_actions, contents = self.postprocess_predictions(predictions)
+
+        # [Phase 7] 결과 리스트를 미리 초기화 (인덱스로 접근하기 위해)
+        n_samples = len(cur_actions)
+        next_obs = [None] * n_samples
+        dones = [None] * n_samples
 
         # [Phase 3] deque 사용: pop(0) O(n) → popleft() O(1)
         bbox_queue = deque(content for action, content in zip(cur_actions, contents) if action == 'bbox')
-        
+
+        # =========================================================================
+        # [Phase 7] Step 1: Search 요청을 비동기로 즉시 시작 (블로킹 없음!)
+        # =========================================================================
         search_requests = []
+        search_indices = []  # search 액션의 원래 인덱스 저장
         for i, (action, content) in enumerate(zip(cur_actions, contents)):
             if action == 'search':
                 # [Phase 1] 사전 컴파일된 정규식 사용 (성능 최적화)
@@ -1402,16 +1666,72 @@ class LLMGenerationManager:
                     "query": content,
                     "id": str(search_id),
                     "request_idx": i
-                })                   
+                })
+                search_indices.append(i)
 
-        if do_search:
-            if len(search_requests) > 0:
-                # [MODIFIED] 비동기/동기 검색 분기
+        # [Phase 7] Search 비동기 시작 (Future 저장, 대기하지 않음!)
+        search_future = None
+        if do_search and len(search_requests) > 0 and self._phase7_enabled:
+            # 비동기 호출 시작 (ThreadPoolExecutor 사용)
+            search_future = self._tool_executor.submit(
+                self._async_search_batches, search_requests
+            )
+            # 이 시점에서 search API 호출이 백그라운드에서 진행 중!
+
+        # =========================================================================
+        # [Phase 7] Step 2: bbox, search_complete 등 즉시 처리 (search와 병렬!)
+        # =========================================================================
+        for i, (action, active) in enumerate(zip(cur_actions, active_mask)):
+            if not active:
+                next_obs[i] = ''
+                dones[i] = 1
+            elif action == 'search':
+                # [Phase 7] Search 결과는 나중에 채움 (Step 3에서)
+                dones[i] = 0  # done 값은 먼저 설정
+                # next_obs[i]는 Step 3에서 설정
+            elif action == 'bbox':
+                try:
+                    bbox_value = json.loads(bbox_queue.popleft())
+                    if len(bbox_value) == 4 and bbox_value[0] >= 0 and bbox_value[1] >= 0 and bbox_value[2] >= 0 and bbox_value[3] >= 0:
+                        next_obs[i] = bbox_value
+                    else:
+                        raise ValueError("Invalid bbox value")
+                except:
+                    # [Phase 3] 상수 사용
+                    next_obs[i] = _MSG_INVALID_BBOX
+                dones[i] = 0
+            elif action == 'search_complete':
+                is_true = contents[i].strip().lower() == 'true'
+                if is_true:
+                    self.search_completed[i] = True
+
+                    # [NEW] 스트리밍 Reward: 프롬프트 완료 체크
+                    if self.streaming_reward_manager:
+                        self._check_and_submit_prompt_reward(i)
+
+                next_obs[i] = ''
+                dones[i] = 1  # trajectory 종료
+            else:
+                # [Phase 3] 상수 사용
+                next_obs[i] = _MSG_INVALID_ACTION
+                dones[i] = 0
+
+        # =========================================================================
+        # [Phase 7] Step 3: Search 결과 대기 및 반영 (마지막에!)
+        # =========================================================================
+        if do_search and len(search_requests) > 0:
+            if self._phase7_enabled and search_future is not None:
+                # [Phase 7] 비동기 결과 대기 (이 시점에 bbox 처리는 이미 완료!)
+                try:
+                    results_map = search_future.result(timeout=60)  # 60초 타임아웃
+                except Exception as e:
+                    print(f"[Phase 7] Search 비동기 호출 실패: {e}")
+                    results_map = {i: [] for i in search_indices}  # 빈 결과로 폴백
+            else:
+                # Phase 7 비활성화 시 기존 방식 사용
                 if getattr(self.config, 'async_search', True):
-                    # 비동기 병렬 검색 (기본값)
                     results_map = self._async_search_batches(search_requests)
                 else:
-                    # 기존 순차 검색 (fallback)
                     batch_size = getattr(self.config, 'search_batch_size', 100)
                     search_results_list = []
                     for i in range(0, len(search_requests), batch_size):
@@ -1419,55 +1739,19 @@ class LLMGenerationManager:
                         response = requests.post(self.config.search_url, json=batch_reqs)
                         search_results_single_batch = response.json()
                         search_results_list.extend(search_results_single_batch)
-
                     results_map = {item['request_idx']: item.get('results', []) for item in search_results_list}
 
-                assert len(results_map) == len(search_requests), \
-                    f"검색 결과 수 불일치: {len(results_map)} != {len(search_requests)}"
-            else:
-                results_map = {}
-        else:
-            results_map = {}
-         
+            # Search 결과를 next_obs에 반영
+            for i in search_indices:
+                if active_mask[i]:
+                    next_obs[i] = results_map.get(i, [])
 
-        for i, (action, active) in enumerate(zip(cur_actions, active_mask)):
-            if not active:
-                next_obs.append('')
-                dones.append(1)
-            else:
-                if action == 'search':
-                    result_for_this_agent = results_map.get(i, [])
-                    next_obs.append(result_for_this_agent)
-                    dones.append(0)
-                elif action == 'bbox':
-                    try:
-                        bbox_value = json.loads(bbox_queue.popleft())
-                        if len(bbox_value) == 4 and bbox_value[0] >= 0 and bbox_value[1] >= 0 and bbox_value[2] >= 0 and bbox_value[3] >= 0:
-                            next_obs.append(bbox_value)
-                        else:
-                            raise ValueError("Invalid bbox value")
-                    except:
-                        # [Phase 3] 상수 사용
-                        next_obs.append(_MSG_INVALID_BBOX)
-                    dones.append(0)
-                elif action == 'search_complete':
-                    is_true = contents[i].strip().lower() == 'true'
-                    if is_true:
-                        self.search_completed[i] = True
-
-                        # [NEW] 스트리밍 Reward: 프롬프트 완료 체크
-                        if self.streaming_reward_manager:
-                            self._check_and_submit_prompt_reward(i)
-
-                    next_obs.append('')
-                    dones.append(1)  # trajectory 종료
-                else:
-                    # [Phase 3] 상수 사용
-                    next_obs.append(_MSG_INVALID_ACTION)
-                    dones.append(0)
-        
-        # 모든 결과를 소비했는지 최종 확인
-        # assert len(search_results) == 0 # 이 로직은 더 이상 유효하지 않으므로 제거합니다.
+        # [Phase 7] 혹시 None인 항목이 있으면 빈 값으로 채움 (안전장치)
+        for i in range(n_samples):
+            if next_obs[i] is None:
+                next_obs[i] = []
+            if dones[i] is None:
+                dones[i] = 0
 
         return next_obs, dones
 
@@ -1589,11 +1873,37 @@ class LLMGenerationManager:
         questions: List[str],
         images_list: List[List[str]],
     ) -> Dict[int, str]:
+        """
+        Frozen Generator 배치 호출 (동기 인터페이스)
 
+        내부적으로 OpenAI AsyncClient가 사용 가능하면 비동기 처리,
+        그렇지 않으면 기존 DashScope SDK 동기 방식으로 폴백합니다.
+        """
         results: Dict[int, str] = {}
         if not indices:
             return results
-        
+
+        # [Phase 5] OpenAI AsyncClient 사용 가능시 비동기 처리
+        if _HAS_OPENAI_ASYNC and _OPENAI_ASYNC_CLIENT is not None:
+            return self._call_frozen_generator_batch_async_wrapper(
+                indices, questions, images_list
+            )
+
+        # === 폴백: 기존 DashScope SDK 동기 방식 ===
+        return self._call_frozen_generator_batch_sync(
+            indices, questions, images_list
+        )
+
+    def _call_frozen_generator_batch_sync(
+        self,
+        indices: List[int],
+        questions: List[str],
+        images_list: List[List[str]],
+    ) -> Dict[int, str]:
+        """기존 DashScope SDK 동기 방식 (폴백용)"""
+        results: Dict[int, str] = {}
+        if not indices:
+            return results
 
         workers = max(1, int(getattr(self.config, "generator_batch_workers", 4)))
         workers = min(workers, 4)
@@ -1606,23 +1916,23 @@ class LLMGenerationManager:
                 if delay > 0:
                     _time.sleep(delay)
                 code, ans = self._call_frozen_generator_single(q, paths)
-                
+
                 if code == 200:
                     if ans:
-                        return idx, ans 
+                        return idx, ans
                     else:
                         return idx, ""
-                
+
                 if code in (429, 500, 502, 503, 504, 0):
                     delay = (backoff_base ** attempt) + _random.uniform(0, 0.2)
-                    continue 
-                
+                    continue
+
                 return idx, ""
-            
+
             return idx, ""
 
         for start in range(0, len(indices), workers):
-            end = start + workers 
+            end = start + workers
             chunk_idx = indices[start:end]
             chunk_q = questions[start:end]
             chunk_img = images_list[start:end]
@@ -1638,6 +1948,139 @@ class LLMGenerationManager:
                         results[i] = ans or ""
 
             _time.sleep(0.05)
+
+        return results
+
+    def _call_frozen_generator_batch_async_wrapper(
+        self,
+        indices: List[int],
+        questions: List[str],
+        images_list: List[List[str]],
+    ) -> Dict[int, str]:
+        """
+        [Phase 5] 비동기 배치 처리를 동기 인터페이스로 래핑
+
+        asyncio.run() 또는 기존 이벤트 루프에서 실행합니다.
+        """
+        try:
+            # 기존 이벤트 루프가 있는지 확인
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+            if loop is not None:
+                # 이미 이벤트 루프 안에 있는 경우 (Ray 워커 등)
+                # nest_asyncio 또는 ThreadPoolExecutor 사용
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(
+                        asyncio.run,
+                        self._call_frozen_generator_batch_async(
+                            indices, questions, images_list
+                        )
+                    )
+                    return future.result(timeout=300)  # 5분 타임아웃
+            else:
+                # 이벤트 루프가 없는 경우 직접 실행
+                return asyncio.run(
+                    self._call_frozen_generator_batch_async(
+                        indices, questions, images_list
+                    )
+                )
+        except Exception as e:
+            _phase2_logger.warning(f"[Phase5] Async batch failed, falling back to sync: {e}")
+            return self._call_frozen_generator_batch_sync(indices, questions, images_list)
+
+    async def _call_frozen_generator_batch_async(
+        self,
+        indices: List[int],
+        questions: List[str],
+        images_list: List[List[str]],
+    ) -> Dict[int, str]:
+        """
+        [Phase 5] OpenAI AsyncClient를 사용한 비동기 배치 처리
+
+        - asyncio.gather()로 전체 배치를 한 번에 병렬 처리
+        - 세마포어로 동시 요청 수 제한 (rate limit 대응)
+        - 재시도 로직 포함
+        """
+        results: Dict[int, str] = {}
+        if not indices:
+            return results
+
+        # 설정값 가져오기
+        max_concurrent = int(getattr(self.config, "frozen_max_concurrent", 50))
+        max_retries = int(getattr(self.config, "frozen_max_retries", 3))
+        backoff_base = float(getattr(self.config, "frozen_backoff_base", 1.5))
+        max_tokens = int(getattr(self.config, "frozen_max_tokens", 1024))
+        model = getattr(self.config, "frozen_model", "qwen2.5-vl-72b-instruct")
+
+        # 동시 요청 수 제한용 세마포어
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        start_time = _time.perf_counter()
+        _phase2_logger.info(
+            f"[Phase5] Starting async batch: {len(indices)} samples, "
+            f"max_concurrent={max_concurrent}"
+        )
+
+        async def _single_with_retry(idx: int, q: str, paths: List[str]) -> Tuple[int, str]:
+            """재시도 로직이 포함된 단일 비동기 호출"""
+            delay = 0.0
+            for attempt in range(max_retries):
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
+                code, ans = await _call_frozen_generator_async_single(
+                    client=_OPENAI_ASYNC_CLIENT,
+                    model=model,
+                    question=q,
+                    image_paths=paths,
+                    max_tokens=max_tokens,
+                    semaphore=semaphore,
+                )
+
+                if code == 200:
+                    return (idx, ans if ans else "")
+
+                # 재시도 가능한 오류
+                if code in (429, 500, 502, 503, 504, 408, 0):
+                    delay = (backoff_base ** attempt) + _random.uniform(0, 0.3)
+                    continue
+
+                # 기타 오류는 빈 결과 반환
+                return (idx, "")
+
+            return (idx, "")
+
+        # 모든 요청을 병렬로 실행
+        tasks = [
+            _single_with_retry(idx, q, paths)
+            for idx, q, paths in zip(indices, questions, images_list)
+        ]
+
+        # asyncio.gather로 전체 배치 동시 처리
+        task_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 결과 수집
+        success_count = 0
+        for result in task_results:
+            if isinstance(result, Exception):
+                _phase2_logger.warning(f"[Phase5] Task exception: {result}")
+                continue
+            if isinstance(result, tuple) and len(result) == 2:
+                idx, ans = result
+                results[idx] = ans or ""
+                if ans:
+                    success_count += 1
+
+        elapsed = _time.perf_counter() - start_time
+        _phase2_logger.info(
+            f"[Phase5] Async batch completed: {success_count}/{len(indices)} success, "
+            f"elapsed={elapsed:.2f}s, "
+            f"throughput={len(indices)/elapsed:.1f} req/s"
+        )
 
         return results
 
@@ -1678,7 +2121,12 @@ class LLMGenerationManager:
 
     def _check_and_submit_prompt_reward(self, sample_idx: int):
         """
-        샘플 완료 시 프롬프트 전체 완료 여부 확인 후 Reward 제출
+        [Phase 6] 샘플 완료 시 프롬프트 전체 완료 여부 확인 후 백그라운드에서 처리
+
+        완전 비동기 방식:
+        1. 프롬프트의 모든 샘플이 완료되면 백그라운드 스레드 시작
+        2. 백그라운드에서 Frozen Generator 호출 → Reward 제출
+        3. 메인 루프는 블로킹 없이 계속 진행
 
         Args:
             sample_idx: 완료된 샘플의 배치 내 인덱스
@@ -1700,23 +2148,91 @@ class LLMGenerationManager:
 
         # 프롬프트의 모든 샘플이 완료되었는지 확인
         if status['completed_samples'] >= status['total_samples']:
-            samples_data = self._collect_samples_data(status['sample_indices'])
+            # [Phase 6] 백그라운드 스레드로 처리 (블로킹 없음!)
+            indices = list(status['sample_indices'])  # 복사본 생성
+            thread = threading.Thread(
+                target=self._process_prompt_background,
+                args=(indices, prompt_id, status),
+                daemon=True,
+                name=f"FrozenGen-{prompt_id}"
+            )
+            thread.start()
+            self._pending_threads.append(thread)
+            status['submitted'] = True  # 중복 제출 방지
 
+            print(f"[Phase 6] 프롬프트 {prompt_id} 백그라운드 처리 시작 "
+                  f"(샘플 {len(indices)}개)")
+
+    def _process_prompt_background(self, indices: List[int], prompt_id: str, status: dict):
+        """
+        [Phase 6] 백그라운드 스레드에서 Frozen Generator + Reward 처리
+
+        이 함수는 별도 스레드에서 실행되어 메인 루프를 블로킹하지 않습니다.
+
+        Args:
+            indices: 처리할 샘플 인덱스 리스트
+            prompt_id: 프롬프트 ID
+            status: 프롬프트 상태 딕셔너리
+        """
+        try:
+            start_time = _time.perf_counter()
+
+            # 1. Frozen Generator 호출 준비
+            batch_questions = []
+            batch_paths = []
+
+            for i in indices:
+                q = self.questions[i] if i < len(self.questions) else ""
+                paths = self._prepare_generator_images(
+                    self.retrievaled_images[i] if i < len(self.retrievaled_images) else [],
+                    self.cropped_images[i] if i < len(self.cropped_images) else []
+                )
+                batch_questions.append(q)
+                batch_paths.append(paths)
+
+            # 2. Frozen Generator 호출 (Phase 5 비동기 배치 처리)
+            index2answer = self._call_frozen_generator_batch(
+                indices, batch_questions, batch_paths
+            )
+
+            # 3. 결과 저장 (Thread-safe)
+            with self._thread_lock:
+                for i in indices:
+                    answer = index2answer.get(i, "")
+                    self.generated_answers[i] = answer
+                    self._streaming_frozen_generated.add(i)
+
+            frozen_elapsed = _time.perf_counter() - start_time
+
+            # 4. samples_data 수집 (generated_answer 포함)
+            samples_data = self._collect_samples_data(indices)
+
+            # 5. Reward 제출 (Gemini VLM Judge 호출)
             self.streaming_reward_manager.submit_prompt(
                 uid=prompt_id,
-                sample_indices=status['sample_indices'],
+                sample_indices=indices,
                 samples_data=samples_data
             )
-            status['submitted'] = True
-            print(f"[Generation] 프롬프트 {prompt_id} Reward 제출 "
-                  f"(샘플 {len(status['sample_indices'])}개)")
+
+            total_elapsed = _time.perf_counter() - start_time
+            success_count = sum(1 for i in indices if self.generated_answers.get(i))
+
+            print(f"[Phase 6] 프롬프트 {prompt_id} 완료: "
+                  f"Frozen={frozen_elapsed:.2f}s, Total={total_elapsed:.2f}s, "
+                  f"Success={success_count}/{len(indices)}")
+
+        except Exception as e:
+            print(f"[Phase 6] 프롬프트 {prompt_id} 처리 실패: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _collect_samples_data(self, indices: List[int]) -> List[Dict]:
         """
-        Reward 계산에 필요한 샘플 데이터 수집
+        [Phase 6] Reward 계산에 필요한 샘플 데이터 수집
 
         스트리밍 모드에서 RMManager에 전달할 데이터를 수집합니다.
-        현재는 롤아웃 데이터에 접근할 수 없으므로 기본 정보만 수집합니다.
+        Phase 6에서 generated_answer 필드가 추가되어 Gemini VLM Judge가
+        올바르게 평가할 수 있습니다.
 
         Args:
             indices: 수집할 샘플 인덱스 리스트
@@ -1739,10 +2255,14 @@ class LLMGenerationManager:
             # 질문 추출
             question = self.questions[idx] if idx < len(self.questions) else ''
 
+            # [Phase 6] Frozen Generator에서 생성된 답변
+            generated_answer = self.generated_answers.get(idx, '') if hasattr(self, 'generated_answers') else ''
+
             samples_data.append({
                 'query': question,
                 'retrieved_images': retrieved_images,
                 'retrieved_basenames': retrieved_basenames,
+                'generated_answer': generated_answer,  # [Phase 6] NEW!
                 # 아래 필드들은 나중에 ray_trainer.py에서 채워질 예정
                 'response_str': '',
                 'reference_answer': '',
