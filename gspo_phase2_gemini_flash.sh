@@ -22,15 +22,38 @@ set -x  # 디버그 모드 (실행 명령어 출력)
 # =============================================================================
 # 1. 환경 설정
 # =============================================================================
+# .env 파일 로드 (루트 폴더)
+if [ -f .env ]; then
+    echo ">>> .env 파일 로드 중..."
+    export $(grep -v '^#' .env | xargs)
+fi
+
+# OpenAI API 키 확인 (Frozen Generator용)
+if [ -z "$OPENAI_API_KEY" ]; then
+    echo "=========================================="
+    echo "ERROR: OPENAI_API_KEY 환경변수가 설정되지 않았습니다!"
+    echo ""
+    echo ".env에 OPENAI_API_KEY를 추가하거나 아래와 같이 설정하세요:"
+    echo "  export OPENAI_API_KEY='your-openai-api-key'"
+    echo "=========================================="
+    exit 1
+fi
+echo ">>> OpenAI API Key 확인 완료"
+
 export PYTHONNOUSERSITE=1
 export PYTHONASYNCIODEBUG=1  
 
-export CUDA_VISIBLE_DEVICES=4,5,6,7
+export export GEMINI_DEBUG_VERBOSE=1
+export export FROZEN_DEBUG_VERBOSE=1
 
-# Ray 임시 디렉토리 설정
-mkdir -p ~/eoeldroal/ray_tmp
-export TMPDIR=~/eoeldroal/ray_tmp
-export RAY_TMPDIR=~/eoeldroal/ray_tmp
+export UVLOOP_AUTO=0
+
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
+# Ray 임시 디렉토리 설정 (AF_UNIX 경로 길이 제한 107바이트 대응)
+mkdir -p /tmp/ray_$USER
+export TMPDIR=/tmp/ray_$USER
+export RAY_TMPDIR=/tmp/ray_$USER
 
 # WandB 설정
 export WANDB_API_KEY='8d955a8fe09693b7a2e983616a79aae912307d79'
@@ -85,25 +108,20 @@ export DASHSCOPE_BASE_URL="${DASHSCOPE_BASE_URL:-https://dashscope-intl.aliyuncs
 ENGINE=${1:-sglang}
 
 # 모델 경로
-model_path=/home/eoeldroal/WorkPlace/DDAI_cleaned/RL_results/gspo_phase1
+model_path=./RL_results/gspo_phase1
 
 # GPU 설정
-n_gpus=4
+n_gpus=8
 
 # 배치 크기 설정
 # - train_batch_size: 원본 프롬프트 수
 # - n_agent: 프롬프트당 생성할 응답 수
 # - 실제 배치 크기 = train_batch_size × n_agent = 64 × 8 = 512
-# train_batch_size=64
-# ppo_mini_batch_size=16
-# ppo_micro_batch_size_per_gpu=1
-# log_prob_micro_batch_size_per_gpu=2
-# n_agent=8
-train_batch_size=4
-ppo_mini_batch_size=4
+train_batch_size=32
+ppo_mini_batch_size=8
 ppo_micro_batch_size_per_gpu=1
 log_prob_micro_batch_size_per_gpu=1
-n_agent=2
+n_agent=4
 
 # 기타 설정
 tensor_model_parallel_size=1
@@ -123,7 +141,7 @@ image_base_path="./data/images"
 gemini_model="gemini-3-flash-preview"
 
 # 동시 API 요청 수 (rate limit 대응)
-max_concurrent_requests=50
+max_concurrent_requests=64
 
 # 스트리밍 Reward 모드 (프롬프트 완료 시 즉시 Reward 계산 시작)
 # - True: Generation과 Reward를 파이프라인으로 병렬 처리 (약 13% 성능 향상)
@@ -135,16 +153,17 @@ streaming_reward_enable=True
 # =============================================================================
 # [Phase 5] OpenAI 호환 비동기 API 사용으로 ~10x 성능 향상
 # - 동시 API 요청 수 (rate limit 대응, 기본값: 50)
-frozen_max_concurrent=50
+frozen_max_concurrent=64
 
 # Frozen Generator 모델명 (DashScope에서 제공하는 모델)
-frozen_model="qwen2.5-vl-72b-instruct"
+# frozen_model="qwen2.5-vl-72b-instruct"
+frozen_model="gpt-5-mini-2025-08-07"
 
 # 최대 토큰 수 (답변 길이)
-frozen_max_tokens=1024
+frozen_max_tokens=2048
 
 # 재시도 설정
-frozen_max_retries=5
+frozen_max_retries=10
 frozen_backoff_base=1.5
 
 # =============================================================================
@@ -191,7 +210,6 @@ python3 -m verl.trainer.main_ppo \
     data.image_key=images \
     actor_rollout_ref.model.path=$model_path \
     actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.actor.optim.lr_warmup_steps=12 \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.1 \
     +actor_rollout_ref.actor.optim.name='AdamW' \
     actor_rollout_ref.model.use_remove_padding=False \
@@ -208,22 +226,18 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
-    actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
     actor_rollout_ref.rollout.free_cache_engine=True \
     actor_rollout_ref.actor.state_masking=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$log_prob_micro_batch_size_per_gpu \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$tensor_model_parallel_size \
     actor_rollout_ref.rollout.name=$ENGINE \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.n=1 \
     actor_rollout_ref.rollout.n_agent=$n_agent \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$log_prob_micro_batch_size_per_gpu \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
-    actor_rollout_ref.actor.use_dynamic_bsz=True \
-    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
-    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
     reward_model.reward_manager='rm' \
     +reward_model.log_path=$log_path \
     +reward_model.gemini_model=$gemini_model \
@@ -250,7 +264,6 @@ python3 -m verl.trainer.main_ppo \
     trainer.resume_mode=auto \
     retriever.url=$search_url \
     max_turns=$max_turns $@
-
 # =============================================================================
 # 9. 완료
 # =============================================================================
