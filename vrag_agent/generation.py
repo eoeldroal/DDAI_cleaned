@@ -23,6 +23,7 @@ import time as _time
 import random as _random
 import asyncio
 import base64 
+import aiohttp 
 
 # ▼▼▼[성능 측정 추가]▼▼▼ 수정
 # GPUMonitor와 시간 기록을 위한 모듈을 가져옵니다.
@@ -51,6 +52,53 @@ if not _phase2_logger.handlers:
 
 # 성능 측정 환경변수 플래그 (기본값: False)
 _PHASE2_PERF_LOG_ENABLED = os.getenv("PHASE2_PERF_LOG", "0") == "1"
+
+# =============================================================================
+# [NEW] Frozen Generator 상세 로깅 설정
+# =============================================================================
+_FROZEN_GEN_LOG_PATH = os.path.join("./logs", "frozen_generator_detail.jsonl")
+os.makedirs(os.path.dirname(_FROZEN_GEN_LOG_PATH), exist_ok=True)
+
+def _log_frozen_generator_detail(
+    idx: int,
+    question: str,
+    image_paths: List[str],
+    answer: str,
+    status_code: int,
+    error: str = None
+):
+    """
+    [NEW] Frozen Generator 상세 로깅
+
+    입력 프롬프트와 출력 응답을 JSONL 파일과 콘솔에 기록합니다.
+    """
+    import datetime
+
+    log_entry = {
+        'timestamp': datetime.datetime.now().isoformat(),
+        'sample_idx': idx,
+        'question': question,
+        'image_paths': image_paths,
+        'answer': answer,
+        'status_code': status_code,
+        'error': error
+    }
+
+    # 콘솔 출력 (간략 버전)
+    status = "SUCCESS" if status_code == 200 and not error else f"ERROR: {error or f'code={status_code}'}"
+    print(f"\n{'='*60}")
+    print(f"[Frozen Generator] Sample {idx} | Status: {status}")
+    print(f"  Question: {question[:100]}{'...' if len(question) > 100 else ''}")
+    print(f"  Images: {image_paths[:3]}{'...' if len(image_paths) > 3 else ''}")
+    print(f"  Answer: {answer[:200]}{'...' if len(answer) > 200 else ''}")
+    print(f"{'='*60}\n")
+
+    # JSONL 파일에 저장
+    try:
+        with open(_FROZEN_GEN_LOG_PATH, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+    except Exception as e:
+        print(f"[Frozen Generator] 상세 로그 저장 실패: {e}")
 
 
 class Phase2PerfTimer:
@@ -169,9 +217,9 @@ def _to_image_part(path: str) -> dict | None:
 
 # =============================================================================
 # [Phase 5] OpenAI SDK 비동기 클라이언트 (Frozen Generator 최적화)
-# - DashScope OpenAI 호환 API 사용
-# - AsyncOpenAI로 진정한 비동기 병렬 처리
-# - 기존 동기 인터페이스 유지하면서 내부적으로 비동기 처리
+# - AsyncOpenAI로 비동기 병렬 처리
+# - 기본: OPENAI_API_KEY(+OPENAI_BASE_URL/FROZEN_OPENAI_BASE_URL)
+# - 없으면 DashScope 호환 키/베이스로 폴백
 # =============================================================================
 _OPENAI_ASYNC_CLIENT = None
 _HAS_OPENAI_ASYNC = False
@@ -179,21 +227,27 @@ _HAS_OPENAI_ASYNC = False
 try:
     from openai import AsyncOpenAI
 
-    _DASHSCOPE_OPENAI_BASE_URL = os.getenv(
+    _PRIMARY_API_KEY = os.getenv("OPENAI_API_KEY")
+    _PRIMARY_BASE_URL = os.getenv("FROZEN_OPENAI_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+
+    _FALLBACK_API_KEY = os.getenv("DASHSCOPE_API_KEY") or os.getenv("DASH_SCOPE_KEY")
+    _FALLBACK_BASE_URL = os.getenv(
         "DASHSCOPE_OPENAI_BASE_URL",
         "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
     )
-    _DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY") or os.getenv("DASH_SCOPE_KEY")
 
-    if _DASHSCOPE_API_KEY:
+    _SELECTED_API_KEY = _PRIMARY_API_KEY or _FALLBACK_API_KEY
+    _SELECTED_BASE_URL = _PRIMARY_BASE_URL or _FALLBACK_BASE_URL
+
+    if _SELECTED_API_KEY:
         _OPENAI_ASYNC_CLIENT = AsyncOpenAI(
-            api_key=_DASHSCOPE_API_KEY,
-            base_url=_DASHSCOPE_OPENAI_BASE_URL,
+            api_key=_SELECTED_API_KEY,
+            base_url=_SELECTED_BASE_URL,
             timeout=60.0,
             max_retries=0,  # 우리가 직접 재시도 로직 관리
         )
         _HAS_OPENAI_ASYNC = True
-        _phase2_logger.info(f"[Phase5] OpenAI AsyncClient initialized: {_DASHSCOPE_OPENAI_BASE_URL}")
+        _phase2_logger.info(f"[Phase5] OpenAI AsyncClient initialized: {_SELECTED_BASE_URL}")
 except ImportError:
     _phase2_logger.warning("[Phase5] OpenAI SDK not installed. Falling back to DashScope SDK.")
 except Exception as e:
@@ -273,10 +327,16 @@ async def _call_frozen_generator_async_single_impl(
         sys_prompt = (
             "You are a visual QA generator. "
             "Use only the provided images and the user question. "
-            "Return ONLY the final answer text without extra explanations."
+            "Return ONLY the final answer text without extra explanations. "
+            "If you need to crop an image, output exactly one line in the form <bbox>[x1, y1, x2, y2]</bbox>. "
+            "BBox rules: pixel coordinates with origin at the top-left (0,0), x increases to the right, y increases downward. "
+            "Must satisfy 0 <= x1 < x2 <= image_width and 0 <= y1 < y2 <= image_height; positive area required. "
+            "Good example: <bbox>[10, 20, 200, 180]</bbox>. "
+            "Bad example (rejected because x1 >= x2): <bbox>[200, 20, 10, 180]</bbox>. "
+            "If the bbox is invalid it will be rejected."
         )
 
-        # OpenAI Vision API 형식으로 메시지 구성
+        # Responses API 형식으로 입력 구성
         user_content = []
 
         # 이미지를 base64로 인코딩하여 추가
@@ -284,35 +344,45 @@ async def _call_frozen_generator_async_single_impl(
             base64_url = _image_to_base64_url(p)
             if base64_url:
                 user_content.append({
-                    "type": "image_url",
-                    "image_url": {"url": base64_url}
+                    "type": "input_image",
+                    "image_url": base64_url,
                 })
 
         # 텍스트 질문 추가
         user_content.append({
-            "type": "text",
+            "type": "input_text",
             "text": f"Question: {qtext}"
         })
 
-        messages = [
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": user_content}
+        inputs = [
+            {"role": "developer", "content": sys_prompt},
+            {"role": "user", "content": user_content},
         ]
 
-        # 비동기 API 호출
-        response = await client.chat.completions.create(
+        # 비동기 API 호출 (Reasoning minimal)
+        response = await client.responses.create(
             model=model,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=0.1,
+            input=inputs,
+            reasoning={"effort": "minimal"},
+            max_output_tokens=max_tokens,
         )
 
         # 응답 추출
-        if response.choices and len(response.choices) > 0:
-            answer = response.choices[0].message.content or ""
-            return (200, answer.strip())
+        answer = getattr(response, "output_text", None)
+        if not answer and getattr(response, "output", None):
+            # fallback: concatenate message/text parts if output_text absent
+            parts = []
+            for item in response.output:
+                if getattr(item, "type", "") in ("message", "output_text"):
+                    if hasattr(item, "content"):
+                        for c in getattr(item, "content", []):
+                            if c.get("type") == "output_text":
+                                parts.append(c.get("text", ""))
+                    elif hasattr(item, "text"):
+                        parts.append(getattr(item, "text", ""))
+            answer = "\n".join([p for p in parts if p])
 
-        return (200, "")
+        return (200, (answer or "").strip())
 
     except Exception as e:
         error_str = str(e).lower()
@@ -388,13 +458,24 @@ _RE_UID_SUFFIX = re.compile(r'(\d+)$')
 # - 루프 내에서 반복 생성되던 문자열을 모듈 레벨 상수로 추출
 # - 가독성 향상 및 유지보수 용이
 # =============================================================================
-_MSG_INVALID_BBOX = (
-    '\n<|im_start|>user\n'
-    'Your previous action is invalid. \n'
-    ' The bbox format is invalid. Expected format: JSON array [x1, y1, x2, y2] with all values >= 0. '
-    'Please try again.\n'
-    '<|im_end|>\n<|im_start|>assistant\n'
+_MSG_INVALID_BBOX_BASE = (
+    "Your previous bbox is invalid.\n"
+    "- Expected one line: <bbox>[x1, y1, x2, y2]</bbox>\n"
+    "- Pixel coordinates, origin at top-left (0,0), x to the right, y downward\n"
+    "- Must satisfy: 0 <= x1 < x2 <= image_width, 0 <= y1 < y2 <= image_height (positive area)\n"
+    "- If x1 >= x2 or y1 >= y2, the bbox will be rejected.\n"
 )
+
+def _format_invalid_bbox_message(reason: str = "") -> str:
+    """Build a user-facing invalid-bbox message with optional reason."""
+    reason_line = f"- We rejected your bbox because: {reason}\n" if reason else ""
+    return (
+        "\n<|im_start|>user\n"
+        f"{_MSG_INVALID_BBOX_BASE}"
+        f"{reason_line}"
+        "Please output a valid bbox now.\n"
+        "<|im_end|>\n<|im_start|>assistant\n"
+    )
 
 _MSG_INVALID_ACTION = (
     '\n<|im_start|>user\n'
@@ -431,8 +512,8 @@ class GenerationConfig:
     frozen_max_concurrent: int = 50          # 동시 API 요청 수 (비동기 모드)
     # [NEW] 검색 최적화 옵션
     async_search: bool = True                # 비동기 병렬 검색 활성화
-    search_batch_size: int = 512             # 검색 요청 배치 크기
-    search_max_workers: int = 16              # 병렬 검색 워커 수 (4→8로 증가)
+    search_batch_size: int = 32              # 검색 요청 배치 크기 (512 -> 32로 줄여서 동시성 확보)
+    search_max_workers: int = 16             # 병렬 검색 워커 수 (4→8로 증가)
     search_timeout: int = 60                 # 검색 타임아웃 (초) - 5초→60초로 증가
     # [Phase 7] Tool 호출 완전 비동기화
     phase7_tool_async: bool = True           # Phase 7 비동기화 활성화 (기본: True)
@@ -453,6 +534,12 @@ class LLMGenerationManager:
         self.actor_rollout_wg = actor_rollout_wg
         self.config = config
         self.is_validation = is_validation
+        # 0: quiet, 1: 요약(질문 일부/이미지 수/답변 일부), 2: 전체 요청/응답
+        _frozen_verbose = os.environ.get("FROZEN_DEBUG_VERBOSE", "0")
+        try:
+            self.verbose_frozen = int(_frozen_verbose)
+        except ValueError:
+            self.verbose_frozen = 1 if str(_frozen_verbose).lower() in ("1", "true", "t", "yes") else 0
 
         self.tensor_fn = TensorHelper(TensorConfig(
             pad_token_id=self.tokenizer.pad_token_id
@@ -483,6 +570,10 @@ class LLMGenerationManager:
         )
         self._search_session.mount('http://', adapter)
         self._search_session.mount('https://', adapter)
+
+        # [Phase 7 최적화] aiohttp 세션 (Lazy Init)
+        self._aio_search_session = None
+        self.search_completed = [] # 초기화 추가
 
         # =========================================================================
         # [Phase 6] 완전 비동기 스트리밍 Reward 지원
@@ -676,120 +767,250 @@ class LLMGenerationManager:
 
         # return next_obs_ids, next_obs_str, multi_modal_data, multi_modal_inputs
     def _process_next_obs(self, next_obs: List, rollings) -> torch.Tensor:
-            """Process next observations from environment."""
-            next_obs_str = []
-            multi_modal_data = []
-            multi_modal_inputs = []
-            merge_length = self.processor.image_processor.merge_size**2
-            
-            for idx, obs_item in enumerate(next_obs):
-                # 1. Invalid String
-                if isinstance(obs_item,str):
-                    next_obs_str.append(obs_item)
-                    multi_modal_data.append({'image': []})
-                    multi_modal_inputs.append(BatchFeature(dict()))
+        """
+        [Phase 8] Parallel BBox Processing
+        BBox Crop 및 Image Processing을 병렬로 수행하여 속도를 최적화합니다.
+        """
+        start_time = _time.perf_counter()
+        batch_size = len(next_obs)
+        
+        # [Safety] Check batch size consistency
+        if self.retrievaled_images is None:
+             # Should not happen if initialized correctly
+             self.retrievaled_images = [[] for _ in range(batch_size)]
+             
+        total_size = len(self.retrievaled_images)
+        if batch_size != total_size:
+            print(f"🚨 [CRITICAL] Batch size mismatch in _process_next_obs: next_obs({batch_size}) vs retrievaled_images({total_size})")
+            if batch_size > total_size:
+                print("  -> Truncating next_obs to match retrievaled_images size.")
+                next_obs = next_obs[:total_size]
+                batch_size = total_size
+            else:
+                print("  -> next_obs is smaller. Proceeding with caution.")
 
-                # 2. Invalid Action (No previous image)
-                elif isinstance(obs_item, list) and not isinstance(obs_item[0],dict) and len(self.retrievaled_images[idx]) == 0:
-                    next_obs_str.append('\n<|im_start|>user\nInvalid action: No image to crop. Please search first.\n<|im_end|>\n<|im_start|>assistant\n')
-                    multi_modal_data.append({'image': []})
-                    multi_modal_inputs.append(BatchFeature(dict()))
+        next_obs_str = [None] * batch_size
+        multi_modal_data = [None] * batch_size
+        multi_modal_inputs = [None] * batch_size
+        
+        merge_length = self.processor.image_processor.merge_size**2
+        
+        # 병렬 처리를 위한 Future 리스트
+        bbox_futures = {} # {future: idx}
 
-                # 3. [BBOX / CROP] 구간
-                elif isinstance(obs_item,list) and not isinstance(obs_item[0],dict):
-                    try:
-                        # 기존 로직 수행
-                        latest_image = rollings.non_tensor_batch['multi_modal_data'][idx]['image'][-1]
-                        width, height = latest_image.size
-                        # [Phase 4] LRU 캐시 적용: 동일 이미지 반복 로딩 시 디스크 I/O 회피
-                        raw_images_crop = _cached_image_open(self.retrievaled_images[idx][-1])
-                        raw_width, raw_height = raw_images_crop.size
+        # 1. Main Loop: Search 처리 및 BBox 작업 스케줄링
+        for idx, obs_item in enumerate(next_obs):
+            # [Safety] Index boundary check
+            if idx >= len(self.retrievaled_images):
+                print(f"[Error] Index {idx} out of bounds for retrievaled_images (len={len(self.retrievaled_images)}). Skipping.")
+                next_obs_str[idx] = ""
+                multi_modal_data[idx] = {'image': []}
+                multi_modal_inputs[idx] = BatchFeature(dict())
+                continue
 
-                        if self.is_validation:
-                            obs_item = [obs_item[0]-28, obs_item[1]-28, obs_item[2]+28, obs_item[3]+28]
-                        crop_area = [int(raw_width * obs_item[0] / width), int(raw_height * obs_item[1] / height), int(raw_width * obs_item[2] / width), int(raw_height * obs_item[3] / height)]
-                        crop_area = [max(0, crop_area[0]), max(0, crop_area[1]), min(raw_width, crop_area[2]), min(raw_height, crop_area[3])]
-                        input_images_list = [raw_images_crop.crop((crop_area[0], crop_area[1], crop_area[2], crop_area[3]))]
-                        raw_images_list = [process_image(image, 512*28*28, 256*28*28) for image in input_images_list]
+            # 1. Invalid String
+            if isinstance(obs_item, str):
+                next_obs_str[idx] = obs_item
+                multi_modal_data[idx] = {'image': []}
+                multi_modal_inputs[idx] = BatchFeature(dict())
+                continue
 
-                        # generator added
-                        # [Phase 4] 비동기 이미지 저장: 블로킹 I/O를 백그라운드로 이동
-                        crop_path = os.path.join(self.config.crops_dir, f"{uuid.uuid4().hex}.jpg")
-                        # 이미지 복사 후 비동기 저장 (원본 객체 수정 방지)
-                        img_to_save = raw_images_list[0].copy()
-                        future = self._save_executor.submit(img_to_save.save, crop_path)
-                        self._pending_saves.append(future)
-                        self.cropped_images[idx].append(crop_path)
+            # 2. Invalid Action (No previous image)
+            if isinstance(obs_item, list) and not isinstance(obs_item[0], dict) and len(self.retrievaled_images[idx]) == 0:
+                next_obs_str[idx] = '\n<|im_start|>user\nInvalid action: No image to crop. Please search first.\n<|im_end|>\n<|im_start|>assistant\n'
+                multi_modal_data[idx] = {'image': []}
+                multi_modal_inputs[idx] = BatchFeature(dict())
+                continue
 
-                        image_inputs = self.processor.image_processor(raw_images_list, return_tensors='pt')
+            # 3. BBox / Crop (Schedule for Parallel Execution)
+            if isinstance(obs_item, list) and not isinstance(obs_item[0], dict):
+                try:
+                    # 필요한 정보 추출 (스레드 안전하게)
+                    latest_image = rollings.non_tensor_batch['multi_modal_data'][idx]['image'][-1]
+                    last_img_path = self.retrievaled_images[idx][-1]
+                    
+                    # Future 제출
+                    future = self._tool_executor.submit(
+                        self._process_bbox_single,
+                        idx, obs_item, latest_image.size, last_img_path, self.is_validation
+                    )
+                    bbox_futures[future] = idx
+                except Exception as e:
+                    print(f"[ProcessObs] BBox schedule error at {idx}: {e}")
+                    next_obs_str[idx] = '\n<|im_start|>user\n[System Error: BBox Scheduling Failed]\n<|im_end|>\n<|im_start|>assistant\n'
+                    multi_modal_data[idx] = {'image': []}
+                    multi_modal_inputs[idx] = BatchFeature(dict())
 
-                        # [검증] pixel_values 확인
-                        if 'pixel_values' in image_inputs:
-                            multi_modal_data.append({'image': raw_images_list})
-                            multi_modal_inputs.append(image_inputs)
-                            image_grid_thw = image_inputs['image_grid_thw']
-                            obs_str = ''.join([f"<|vision_start|>{self.processor.image_token * (image_grid_thw_item.prod() // merge_length)}<|vision_end|>" for image_grid_thw_item in image_grid_thw])
-                            raw_obs_str = f"<|vision_start|>{self.processor.image_token}<|vision_end|>" * len(image_grid_thw)
-                            obs_str = '\n<|im_start|>user\n' + obs_str + '<|im_end|>\n<|im_start|>assistant\n'
-                            next_obs_str.append(obs_str)
-                        else:
-                            raise ValueError("BBox processing produced no pixel_values")
-
-                    except Exception as e:
-                        # [BBOX 실패 시 명확한 에러 메시지]
-                        print(f"[DEBUG] Bbox Error at idx {idx}: {e}")
-                        next_obs_str.append('\n<|im_start|>user\n[System Error: Bbox Crop Failed] The image crop operation failed. Please try a different action.\n<|im_end|>\n<|im_start|>assistant\n')
-                        multi_modal_data.append({'image': []})
-                        multi_modal_inputs.append(BatchFeature(dict()))
-
-                # 4. [SEARCH / RETRIEVAL] 구간
-                elif isinstance(obs_item,list) and isinstance(obs_item[0],dict):
-
+            # 4. Search / Retrieval (Process Immediately due to State Dependency)
+            elif isinstance(obs_item, list) and isinstance(obs_item[0], dict):
+                try:
                     img_file_list = [item['image_file'] for item in obs_item]
+                    input_images_list = []
+                    
+                    # 상태 업데이트 (retrievaled_images)
                     for image_item in img_file_list:
                         if image_item not in self.retrievaled_images[idx]:
                             self.retrievaled_images[idx].append(image_item)
                             input_images_list = [image_item]
                             break
                     
-                    try:
-                        raw_images_list = [process_image(image, 512*28*28, 256*28*28) for image in input_images_list]
-                        image_inputs = self.processor.image_processor(raw_images_list, return_tensors='pt')
-
-                        if 'pixel_values' in image_inputs:
-                            multi_modal_data.append({'image': raw_images_list})
-                            multi_modal_inputs.append(image_inputs)
-                            
-                            image_grid_thw = image_inputs['image_grid_thw']
-                            obs_str = ''.join([f"<|vision_start|>{self.processor.image_token * (image_grid_thw_item.prod() // merge_length)}<|vision_end|>" for image_grid_thw_item in image_grid_thw])
-                            obs_str = '\n<|im_start|>user\n' + obs_str + '<|im_end|>\n<|im_start|>assistant\n'
-                            next_obs_str.append(obs_str)
+                    if not input_images_list:
+                        # 이미 있는 이미지이거나 없는 경우? (기존 로직 유지)
+                        # 기존 로직은 input_images_list가 비면 에러가 날 수 있음. 방어 코드 추가.
+                        if len(img_file_list) > 0:
+                             input_images_list = [img_file_list[0]] # Fallback to first
                         else:
-                            # [SEARCH 실패 시 명확한 에러 메시지]
-                            print(f"[DEBUG] Search Image Error at idx {idx}: No pixel_values")
-                            error_msg = "\n<|im_start|>user\n[System Error: Search Image Failed] The retrieved image is corrupted or invalid.\n<|im_end|>\n<|im_start|>assistant\n"
-                            next_obs_str.append(error_msg)
-                            multi_modal_data.append({'image': []})
-                            multi_modal_inputs.append(BatchFeature(dict()))
+                             raise ValueError("No images returned from search")
 
-                    except Exception as e:
-                        print(f"[DEBUG] Search Processing Exception at idx {idx}: {e}")
-                        error_msg = "\n<|im_start|>user\n[System Error: Search Image Processing Exception]\n<|im_end|>\n<|im_start|>assistant\n"
-                        next_obs_str.append(error_msg)
-                        multi_modal_data.append({'image': []})
-                        multi_modal_inputs.append(BatchFeature(dict()))
+                    raw_images_list = [process_image(image, 512*28*28, 256*28*28) for image in input_images_list]
+                    image_inputs = self.processor.image_processor(raw_images_list, return_tensors='pt')
 
-                else:
-                    raise ValueError('invalid observation')
+                    if 'pixel_values' in image_inputs:
+                        multi_modal_data[idx] = {'image': raw_images_list}
+                        multi_modal_inputs[idx] = image_inputs
+                        
+                        image_grid_thw = image_inputs['image_grid_thw']
+                        obs_str = ''.join([f"<|vision_start|>{self.processor.image_token * (image_grid_thw_item.prod() // merge_length)}<|vision_end|>" for image_grid_thw_item in image_grid_thw])
+                        next_obs_str[idx] = '\n<|im_start|>user\n' + obs_str + '<|im_end|>\n<|im_start|>assistant\n'
+                    else:
+                        raise ValueError("No pixel_values in search result")
+
+                except Exception as e:
+                    # print(f"[DEBUG] Search Error at idx {idx}: {e}")
+                    next_obs_str[idx] = "\n<|im_start|>user\n[System Error: Search Image Failed]\n<|im_end|>\n<|im_start|>assistant\n"
+                    multi_modal_data[idx] = {'image': []}
+                    multi_modal_inputs[idx] = BatchFeature(dict())
             
-            next_obs_ids = self.tokenizer(
-                next_obs_str, 
-                padding='longest',
-                return_tensors='pt',
-                add_special_tokens=False,
-            )['input_ids']
+            else:
+                raise ValueError(f'Invalid observation at idx {idx}')
 
-            return next_obs_ids, next_obs_str, multi_modal_data, multi_modal_inputs
+        if bbox_futures:
+            _phase2_logger.info(f"[Tool:BBox] Scheduled {len(bbox_futures)} parallel crop tasks.")
+
+        # 2. Collect Parallel BBox Results
+        if bbox_futures:
+            for future in as_completed(bbox_futures):
+                idx = bbox_futures[future]
+                try:
+                    result = future.result()
+                    
+                    # 비동기 저장 요청 (결과 처리와 별개로)
+                    if 'img_to_save' in result and 'crop_path' in result:
+                        self.cropped_images[idx].append(result['crop_path'])
+                        self._save_executor.submit(result['img_to_save'].save, result['crop_path'])
+
+                    multi_modal_data[idx] = {'image': result['raw_images_list']}
+                    multi_modal_inputs[idx] = result['image_inputs']
+                    next_obs_str[idx] = result['obs_str']
+
+                except Exception as e:
+                    # 짧은 요약 + 필요 시 상세 로그
+                    bbox_verbose = os.environ.get("BBOX_DEBUG_VERBOSE", "0") in ("1", "true", "True")
+                    msg = f"[Tool:BBox] Worker Error at idx {idx}: {e}"
+                    if bbox_verbose:
+                        _phase2_logger.error(msg)
+                    else:
+                        _phase2_logger.warning(msg)
+                    next_obs_str[idx] = _format_invalid_bbox_message(str(e))
+                    multi_modal_data[idx] = {'image': []}
+                    multi_modal_inputs[idx] = BatchFeature(dict())
+            
+            _phase2_logger.info(f"[Tool:BBox] All tasks completed in {_time.perf_counter() - start_time:.3f}s")
+
+        # 3. Finalize: None인 항목 채우기 (안전장치)
+        for i in range(batch_size):
+            if next_obs_str[i] is None:
+                next_obs_str[i] = ""
+            if multi_modal_data[i] is None:
+                multi_modal_data[i] = {'image': []}
+            if multi_modal_inputs[i] is None:
+                multi_modal_inputs[i] = BatchFeature(dict())
+
+        # 4. Tokenize
+        next_obs_ids = self.tokenizer(
+            next_obs_str, 
+            padding='longest',
+            return_tensors='pt',
+            add_special_tokens=False,
+        )['input_ids']
+
+        return next_obs_ids, next_obs_str, multi_modal_data, multi_modal_inputs
+
+    def _process_bbox_single(self, idx, obs_item, size, last_img_path, is_validation):
+        """Worker function for BBox processing"""
+        start_time = _time.perf_counter()
+        # _phase2_logger.debug(f"[Tool:BBox] Idx {idx}: Start processing. Coords={obs_item}, Image={last_img_path}")
+
+        width, height = size
+        bbox_verbose = os.environ.get("BBOX_DEBUG_VERBOSE", "0") in ("1", "true", "True")
+        
+        # [Safety] Prevent ZeroDivisionError
+        if width <= 0 or height <= 0:
+            raise ValueError(f"Invalid image size: {width}x{height}")
+
+        # IO: Load Image (Cached)
+        raw_images_crop = _cached_image_open(last_img_path)
+        raw_width, raw_height = raw_images_crop.size
+
+        # Validation Adjustment
+        if is_validation:
+            obs_item = [obs_item[0]-28, obs_item[1]-28, obs_item[2]+28, obs_item[3]+28]
+        
+        # CPU: Calculate Crop
+        crop_area = [int(raw_width * obs_item[0] / width), int(raw_height * obs_item[1] / height), int(raw_width * obs_item[2] / width), int(raw_height * obs_item[3] / height)]
+        crop_area = [max(0, crop_area[0]), max(0, crop_area[1]), min(raw_width, crop_area[2]), min(raw_height, crop_area[3])]
+        
+        # CPU: Perform Crop
+        try:
+            input_images_list = [raw_images_crop.crop((crop_area[0], crop_area[1], crop_area[2], crop_area[3]))]
+        except Exception as e:
+            msg = f"Crop failed (idx={idx}): {e}"
+            if bbox_verbose:
+                _phase2_logger.error(msg)
+            else:
+                _phase2_logger.warning(msg)
+            raise
+        
+        # CPU: Resize (Heavy)
+        raw_images_list = [process_image(image, 512*28*28, 256*28*28) for image in input_images_list]
+
+        # Async Save Prep
+        crop_path = os.path.join(self.config.crops_dir, f"{uuid.uuid4().hex}.jpg")
+        img_to_save = raw_images_list[0].copy()
+
+        # CPU: Image Processor (Heavy)
+        image_inputs = self.processor.image_processor(raw_images_list, return_tensors='pt')
+
+        if 'pixel_values' not in image_inputs:
+            raise ValueError("BBox processing produced no pixel_values")
+
+        # Result Formatting
+        # [Test Support] Handle MagicMock or missing merge_size
+        merge_size = getattr(self.processor.image_processor, 'merge_size', 2)
+        try:
+            merge_size = int(merge_size)
+        except:
+            merge_size = 2
+            
+        merge_length = merge_size**2
+        if merge_length <= 0:
+            merge_length = 4 # Fallback default
+
+        image_grid_thw = image_inputs['image_grid_thw']
+        obs_str = ''.join([f"<|vision_start|>{self.processor.image_token * (image_grid_thw_item.prod() // merge_length)}<|vision_end|>" for image_grid_thw_item in image_grid_thw])
+        obs_str = '\n<|im_start|>user\n' + obs_str + '<|im_end|>\n<|im_start|>assistant\n'
+
+        duration = _time.perf_counter() - start_time
+        # _phase2_logger.debug(f"[Tool:BBox] Idx {idx}: Completed in {duration:.4f}s")
+
+        return {
+            'raw_images_list': raw_images_list,
+            'image_inputs': image_inputs,
+            'obs_str': obs_str,
+            'crop_path': crop_path,
+            'img_to_save': img_to_save
+        }
+
 #//
 
     # def _concat_multi_modal_data(self, rollings, next_obs_multi_modal_data:list, next_obs_multi_modal_inputs:list):
@@ -1159,6 +1380,9 @@ class LLMGenerationManager:
         """Run main LLM generation loop."""
 
         meta_info = {}
+
+        # [FIX] gen_batch를 멤버로 저장하여 _collect_samples_data에서 ground_truth 접근 가능
+        self._current_gen_batch = gen_batch
 
         # [NEW] 스트리밍 모드 초기화
         if self.streaming_reward_manager:
@@ -1539,6 +1763,191 @@ class LLMGenerationManager:
         return final_output
 
     # =========================================================================
+    # [Phase 8] Async Pipeline & Aiohttp Search
+    # =========================================================================
+    def _get_aio_session(self):
+        """Lazy initialization of aiohttp session."""
+        if self._aio_search_session is None or self._aio_search_session.closed:
+            # Check for running loop
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                # No loop running, session creation deferred or created without loop
+                loop = None
+            
+            timeout = aiohttp.ClientTimeout(total=self.config.search_timeout)
+            connector = aiohttp.TCPConnector(limit=self.config.search_max_workers * 2) 
+            # Note: ClientSession typically needs to be created inside a coroutine
+            # but if we are here, we might be inside one.
+            self._aio_search_session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+        return self._aio_search_session
+
+    async def _async_search_batches_aio(self, search_requests: List[Dict]) -> Dict[int, List]:
+        """
+        [Phase 8] True Async Search using aiohttp.
+        Replaces ThreadPoolExecutor + requests with asyncio + aiohttp.
+        """
+        if not search_requests:
+            return {}
+
+        batch_size = self.config.search_batch_size
+        # Split into batches
+        batches = [
+            search_requests[i:i + batch_size]
+            for i in range(0, len(search_requests), batch_size)
+        ]
+
+        url = self.config.search_url
+        max_retries = 3
+        
+        start_time = _time.perf_counter()
+        _phase2_logger.info(f"[Tool:Search] Starting async search for {len(search_requests)} requests ({len(batches)} batches).")
+
+        # [Fix] Create session per pipeline execution to avoid 'Event loop is closed'
+        timeout = aiohttp.ClientTimeout(total=self.config.search_timeout)
+        connector = aiohttp.TCPConnector(limit=self.config.search_max_workers * 2)
+
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            async def _fetch_batch(batch, batch_idx):
+                batch_start = _time.perf_counter()
+                for attempt in range(max_retries):
+                    try:
+                        async with session.post(url, json=batch) as response:
+                            response.raise_for_status()
+                            data = await response.json()
+                            duration = _time.perf_counter() - batch_start
+                            _phase2_logger.debug(f"[Tool:Search] Batch {batch_idx} completed in {duration:.3f}s ({len(data)} results)")
+                            return data
+                    except Exception as e:
+                        if attempt == max_retries - 1:
+                            _phase2_logger.error(f"[Tool:Search] Batch {batch_idx} failed after {max_retries} retries: {e}")
+                            return [] # Return empty on failure
+                        
+                        wait_time = 0.5 * (2 ** attempt)
+                        _phase2_logger.warning(f"[Tool:Search] Batch {batch_idx} retry {attempt+1}/{max_retries} (error: {e}). Waiting {wait_time:.1f}s.")
+                        await asyncio.sleep(wait_time) # Exponential backoff
+                return []
+
+            # Execute all batches concurrently
+            results_list = await asyncio.gather(*[_fetch_batch(b, i) for i, b in enumerate(batches)])
+        
+        # Flatten results
+        all_results = []
+        for res in results_list:
+            if res:
+                all_results.extend(res)
+
+        elapsed = _time.perf_counter() - start_time
+        _phase2_logger.info(f"[Tool:Search] All batches completed in {elapsed:.3f}s. Total results received: {len(all_results)}")
+
+        # Map to request_idx
+        results_map = {
+            item['request_idx']: item.get('results', [])
+            for item in all_results
+        }
+        return results_map
+
+    async def _execute_async_pipeline(self, predictions: List[str], uids: np.ndarray, pad_token: str, active_mask=None, do_search=True) -> Tuple[List[Any], List[Any]]:
+        """
+        [Phase 8] 완전 비동기 파이프라인 (Async Pipeline)
+        Search (I/O)와 BBox Crop/Process (CPU)를 병렬로 실행합니다.
+        """
+        pipeline_start = _time.perf_counter()
+        
+        cur_actions, contents = self.postprocess_predictions(predictions)
+        n_samples = len(cur_actions)
+        next_obs = [None] * n_samples
+        dones = [None] * n_samples
+        
+        # 1. Search Request 수집
+        search_requests = []
+        search_indices = []
+        for i, (action, content) in enumerate(zip(cur_actions, contents)):
+            if action == 'search':
+                m = _RE_UID_SUFFIX.search(str(uids[i]))
+                search_id = int(m.group(1)) if m else -1
+                search_requests.append({
+                    "query": content,
+                    "id": str(search_id),
+                    "request_idx": i
+                })
+                search_indices.append(i)
+
+        # 2. Search Task 시작 (Non-blocking)
+        search_task = None
+        if do_search and search_requests:
+            _phase2_logger.info(f"[Pipeline] Launching async search task for {len(search_requests)} requests.")
+            # aiohttp 기반 비동기 검색 시작
+            search_task = asyncio.create_task(self._async_search_batches_aio(search_requests))
+
+        # 3. BBox 및 기타 액션 처리 (CPU 작업 - Search 대기 시간 동안 수행)
+        bbox_queue = deque(content for action, content in zip(cur_actions, contents) if action == 'bbox')
+        
+        for i, (action, active) in enumerate(zip(cur_actions, active_mask)):
+            if not active:
+                next_obs[i] = ''
+                dones[i] = 1
+                continue
+            
+            if action == 'search':
+                dones[i] = 0
+                # next_obs[i]는 나중에 search_task 완료 후 채움
+            
+            elif action == 'bbox':
+                dones[i] = 0
+                try:
+                    bbox_value = json.loads(bbox_queue.popleft())
+                    # 유효성 검사
+                    if len(bbox_value) == 4 and all(v >= 0 for v in bbox_value):
+                        next_obs[i] = bbox_value
+                    else:
+                        raise ValueError("Invalid bbox value (length!=4 or negative value)")
+                except Exception as e:
+                    reason = str(e)
+                    next_obs[i] = _format_invalid_bbox_message(reason)
+            
+            elif action == 'search_complete':
+                is_true = contents[i].strip().lower() == 'true'
+                if is_true:
+                    self.search_completed[i] = True
+                    if self.streaming_reward_manager:
+                        self._check_and_submit_prompt_reward(i)
+                next_obs[i] = ''
+                dones[i] = 1
+            
+            else:
+                next_obs[i] = _MSG_INVALID_ACTION
+                dones[i] = 0
+
+        # 4. Search 결과 대기 및 병합
+        if search_task:
+            try:
+                # CPU 작업이 끝난 후 검색 결과를 기다림 (Overlapping 효과)
+                results_map = await search_task
+                
+                pipeline_duration = _time.perf_counter() - pipeline_start
+                _phase2_logger.info(f"[Pipeline] Search results received. Total pipeline latency: {pipeline_duration:.3f}s")
+                
+                for i in search_indices:
+                    if active_mask[i]:
+                        next_obs[i] = results_map.get(i, [])
+            except Exception as e:
+                _phase2_logger.error(f"[AsyncPipeline] Search failed: {e}")
+                # 실패 시 빈 리스트로 처리
+                for i in search_indices:
+                    if active_mask[i]:
+                        next_obs[i] = []
+
+        # 5. 안전 장치 (None 제거)
+        for i in range(n_samples):
+            if next_obs[i] is None:
+                next_obs[i] = []
+            if dones[i] is None:
+                dones[i] = 0
+                
+        return next_obs, dones
+
+    # =========================================================================
     # [NEW] 비동기 병렬 검색 메서드
     # =========================================================================
     def _search_single_batch(self, batch_reqs: List[Dict], max_retries: int = 3) -> List[Dict]:
@@ -1632,129 +2041,38 @@ class LLMGenerationManager:
     # execute_predictions 함수
     def execute_predictions(self, predictions: List[str], uids: np.ndarray, pad_token: str, active_mask=None, do_search=True) -> List[str]:
         """
-        [Phase 7] Tool 호출 완전 비동기화
-
-        핵심 변경:
-        1. Search API 호출을 비동기로 즉시 시작 (블로킹 없음)
-        2. bbox, search_complete를 search와 병렬로 처리
-        3. Search 결과는 마지막에 대기
-
-        이로 인해 bbox 처리 시간과 search API 대기 시간이 중첩됩니다.
+        [Phase 8] Async Pipeline Wrapper
+        
+        기존 동기 인터페이스를 유지하면서 내부적으로 _execute_async_pipeline을 호출합니다.
         """
-        cur_actions, contents = self.postprocess_predictions(predictions)
+        try:
+            # 1. 기존 이벤트 루프 확인
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
 
-        # [Phase 7] 결과 리스트를 미리 초기화 (인덱스로 접근하기 위해)
-        n_samples = len(cur_actions)
-        next_obs = [None] * n_samples
-        dones = [None] * n_samples
-
-        # [Phase 3] deque 사용: pop(0) O(n) → popleft() O(1)
-        bbox_queue = deque(content for action, content in zip(cur_actions, contents) if action == 'bbox')
-
-        # =========================================================================
-        # [Phase 7] Step 1: Search 요청을 비동기로 즉시 시작 (블로킹 없음!)
-        # =========================================================================
-        search_requests = []
-        search_indices = []  # search 액션의 원래 인덱스 저장
-        for i, (action, content) in enumerate(zip(cur_actions, contents)):
-            if action == 'search':
-                # [Phase 1] 사전 컴파일된 정규식 사용 (성능 최적화)
-                m = _RE_UID_SUFFIX.search(str(uids[i]))
-                search_id = int(m.group(1)) if m else -1
-
-                search_requests.append({
-                    "query": content,
-                    "id": str(search_id),
-                    "request_idx": i
-                })
-                search_indices.append(i)
-
-        # [Phase 7] Search 비동기 시작 (Future 저장, 대기하지 않음!)
-        search_future = None
-        if do_search and len(search_requests) > 0 and self._phase7_enabled:
-            # 비동기 호출 시작 (ThreadPoolExecutor 사용)
-            search_future = self._tool_executor.submit(
-                self._async_search_batches, search_requests
-            )
-            # 이 시점에서 search API 호출이 백그라운드에서 진행 중!
-
-        # =========================================================================
-        # [Phase 7] Step 2: bbox, search_complete 등 즉시 처리 (search와 병렬!)
-        # =========================================================================
-        for i, (action, active) in enumerate(zip(cur_actions, active_mask)):
-            if not active:
-                next_obs[i] = ''
-                dones[i] = 1
-            elif action == 'search':
-                # [Phase 7] Search 결과는 나중에 채움 (Step 3에서)
-                dones[i] = 0  # done 값은 먼저 설정
-                # next_obs[i]는 Step 3에서 설정
-            elif action == 'bbox':
-                try:
-                    bbox_value = json.loads(bbox_queue.popleft())
-                    if len(bbox_value) == 4 and bbox_value[0] >= 0 and bbox_value[1] >= 0 and bbox_value[2] >= 0 and bbox_value[3] >= 0:
-                        next_obs[i] = bbox_value
-                    else:
-                        raise ValueError("Invalid bbox value")
-                except:
-                    # [Phase 3] 상수 사용
-                    next_obs[i] = _MSG_INVALID_BBOX
-                dones[i] = 0
-            elif action == 'search_complete':
-                is_true = contents[i].strip().lower() == 'true'
-                if is_true:
-                    self.search_completed[i] = True
-
-                    # [NEW] 스트리밍 Reward: 프롬프트 완료 체크
-                    if self.streaming_reward_manager:
-                        self._check_and_submit_prompt_reward(i)
-
-                next_obs[i] = ''
-                dones[i] = 1  # trajectory 종료
+            if loop is not None:
+                # 이미 이벤트 루프가 있는 경우 (예: Ray Worker, Jupyter)
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(
+                        asyncio.run, 
+                        self._execute_async_pipeline(predictions, uids, pad_token, active_mask, do_search)
+                    )
+                    return future.result(timeout=120) # 2분 타임아웃
             else:
-                # [Phase 3] 상수 사용
-                next_obs[i] = _MSG_INVALID_ACTION
-                dones[i] = 0
-
-        # =========================================================================
-        # [Phase 7] Step 3: Search 결과 대기 및 반영 (마지막에!)
-        # =========================================================================
-        if do_search and len(search_requests) > 0:
-            if self._phase7_enabled and search_future is not None:
-                # [Phase 7] 비동기 결과 대기 (이 시점에 bbox 처리는 이미 완료!)
-                try:
-                    results_map = search_future.result(timeout=60)  # 60초 타임아웃
-                except Exception as e:
-                    print(f"[Phase 7] Search 비동기 호출 실패: {e}")
-                    results_map = {i: [] for i in search_indices}  # 빈 결과로 폴백
-            else:
-                # Phase 7 비활성화 시 기존 방식 사용
-                if getattr(self.config, 'async_search', True):
-                    results_map = self._async_search_batches(search_requests)
-                else:
-                    batch_size = getattr(self.config, 'search_batch_size', 100)
-                    search_results_list = []
-                    for i in range(0, len(search_requests), batch_size):
-                        batch_reqs = search_requests[i:i + batch_size]
-                        response = requests.post(self.config.search_url, json=batch_reqs)
-                        search_results_single_batch = response.json()
-                        search_results_list.extend(search_results_single_batch)
-                    results_map = {item['request_idx']: item.get('results', []) for item in search_results_list}
-
-            # Search 결과를 next_obs에 반영
-            for i in search_indices:
-                if active_mask[i]:
-                    next_obs[i] = results_map.get(i, [])
-
-        # [Phase 7] 혹시 None인 항목이 있으면 빈 값으로 채움 (안전장치)
-        for i in range(n_samples):
-            if next_obs[i] is None:
-                next_obs[i] = []
-            if dones[i] is None:
-                dones[i] = 0
-
-        return next_obs, dones
-
+                # 이벤트 루프가 없는 경우
+                return asyncio.run(
+                    self._execute_async_pipeline(predictions, uids, pad_token, active_mask, do_search)
+                )
+        except Exception as e:
+            print(f"[ExecutePredictions] Async pipeline failed, error: {e}")
+            import traceback
+            traceback.print_exc()
+            # 실패 시 안전하게 빈 결과 반환
+            n_samples = len(predictions)
+            return [[]] * n_samples, [0] * n_samples
 
     def postprocess_predictions(self, predictions: List[Any]) -> Tuple[List[int], List[bool]]:
         """
@@ -1918,6 +2236,15 @@ class LLMGenerationManager:
                 code, ans = self._call_frozen_generator_single(q, paths)
 
                 if code == 200:
+                    # [NEW] Frozen Generator 상세 로깅 (성공 - 동기)
+                    _log_frozen_generator_detail(
+                        idx=idx,
+                        question=q,
+                        image_paths=paths,
+                        answer=ans if ans else "",
+                        status_code=code,
+                        error=None
+                    )
                     if ans:
                         return idx, ans
                     else:
@@ -1927,8 +2254,26 @@ class LLMGenerationManager:
                     delay = (backoff_base ** attempt) + _random.uniform(0, 0.2)
                     continue
 
+                # [NEW] Frozen Generator 상세 로깅 (오류 - 동기)
+                _log_frozen_generator_detail(
+                    idx=idx,
+                    question=q,
+                    image_paths=paths,
+                    answer="",
+                    status_code=code,
+                    error=f"Non-retryable error code: {code}"
+                )
                 return idx, ""
 
+            # [NEW] Frozen Generator 상세 로깅 (최대 재시도 초과 - 동기)
+            _log_frozen_generator_detail(
+                idx=idx,
+                question=q,
+                image_paths=paths,
+                answer="",
+                status_code=0,
+                error=f"Max retries ({max_retries}) exceeded (sync fallback)"
+            )
             return idx, ""
 
         for start in range(0, len(indices), workers):
@@ -2032,6 +2377,11 @@ class LLMGenerationManager:
                 if delay > 0:
                     await asyncio.sleep(delay)
 
+                if self.verbose_frozen >= 1:
+                    q_snippet = (q[:160] + ("..." if len(q) > 160 else ""))
+                    print(f"[FROZEN][REQUEST idx={idx} attempt={attempt+1}] q={q_snippet} | images={len(paths)}")
+                    if self.verbose_frozen >= 2:
+                        print(f"[FROZEN][REQUEST FULL idx={idx}] question={q}\n  images={paths}")
                 code, ans = await _call_frozen_generator_async_single(
                     client=_OPENAI_ASYNC_CLIENT,
                     model=model,
@@ -2042,6 +2392,20 @@ class LLMGenerationManager:
                 )
 
                 if code == 200:
+                    # [NEW] Frozen Generator 상세 로깅 (성공)
+                    _log_frozen_generator_detail(
+                        idx=idx,
+                        question=q,
+                        image_paths=paths,
+                        answer=ans if ans else "",
+                        status_code=code,
+                        error=None
+                    )
+                    if self.verbose_frozen >= 1:
+                        ans_snippet = (ans[:160] + ("..." if len(ans) > 160 else "")) if ans else ""
+                        print(f"[FROZEN][RESPONSE idx={idx}] status=200 answer={ans_snippet}")
+                        if self.verbose_frozen >= 2:
+                            print(f"[FROZEN][RESPONSE FULL idx={idx}] answer={ans}")
                     return (idx, ans if ans else "")
 
                 # 재시도 가능한 오류
@@ -2050,9 +2414,28 @@ class LLMGenerationManager:
                     continue
 
                 # 기타 오류는 빈 결과 반환
+                # [NEW] Frozen Generator 상세 로깅 (오류)
+                _log_frozen_generator_detail(
+                    idx=idx,
+                    question=q,
+                    image_paths=paths,
+                    answer="",
+                    status_code=code,
+                    error=f"Non-retryable error code: {code}"
+                )
                 return (idx, "")
 
-            return (idx, "")
+            # [NEW] Frozen Generator 상세 로깅 (최대 재시도 초과)
+            _log_frozen_generator_detail(
+                idx=idx,
+                question=q,
+                image_paths=paths,
+                answer="",
+                status_code=0,
+                error=f"Max retries ({max_retries}) exceeded"
+            )
+            # 기본 문자열을 반환해 downstream EMPTY 처리를 피한다
+            return (idx, "No answer")
 
         # 모든 요청을 병렬로 실행
         tasks = [
@@ -2104,10 +2487,11 @@ class LLMGenerationManager:
 
         for prompt_idx in range(num_prompts):
             base_idx = prompt_idx * n_agent
-            # uid에서 고유 프롬프트 ID 추출 (n_agent 샘플들은 같은 베이스 uid를 공유)
-            uid = str(uids[base_idx])
-            # uid에서 마지막 숫자 부분 제거하여 프롬프트 ID 생성
-            prompt_id = uid.rsplit('_', 1)[0] if '_' in uid else uid
+            # 프롬프트 ID는 그대로 사용해 충돌을 방지한다 (uuid 전체 사용).
+            prompt_id = str(uids[base_idx])
+            # 혹시 동일 ID가 이미 존재하면 프롬프트 인덱스를 덧붙여 고유성 보장
+            if prompt_id in self._prompt_completion_status:
+                prompt_id = f"{prompt_id}-{prompt_idx}"
 
             self._prompt_completion_status[prompt_id] = {
                 'total_samples': n_agent,
@@ -2242,6 +2626,41 @@ class LLMGenerationManager:
         """
         samples_data = []
 
+        # [FIX] gen_batch에서 ground_truth 정보 가져오기
+        gen_batch = getattr(self, '_current_gen_batch', None)
+        ground_truths = []
+        reference_image_paths_list = []
+        reference_basenames_list = []
+
+        if gen_batch is not None:
+            try:
+                # reward_model에서 ground_truth 가져오기
+                reward_model_data = gen_batch.non_tensor_batch.get('reward_model', {})
+                if isinstance(reward_model_data, dict):
+                    ground_truths = reward_model_data.get('ground_truth', [])
+                elif hasattr(reward_model_data, '__iter__'):
+                    # numpy array 또는 리스트인 경우
+                    ground_truths = [
+                        item.get('ground_truth', '') if isinstance(item, dict) else str(item)
+                        for item in reward_model_data
+                    ]
+
+                # extra_info에서 reference 이미지 정보 가져오기
+                extra_infos = gen_batch.non_tensor_batch.get('extra_info', [])
+                for info in extra_infos:
+                    if isinstance(info, dict):
+                        ref_paths = info.get('reference_image_paths', [])
+                        reference_image_paths_list.append(ref_paths)
+                        reference_basenames_list.append([
+                            os.path.basename(p.rstrip('/')).split(".jpg")[0]
+                            for p in ref_paths
+                        ])
+                    else:
+                        reference_image_paths_list.append([])
+                        reference_basenames_list.append([])
+            except Exception as e:
+                print(f"[WARNING] ground_truth 추출 실패: {e}")
+
         for idx in indices:
             # 검색된 이미지 경로
             retrieved_images = list(self.retrievaled_images[idx]) if idx < len(self.retrievaled_images) else []
@@ -2258,19 +2677,25 @@ class LLMGenerationManager:
             # [Phase 6] Frozen Generator에서 생성된 답변
             generated_answer = self.generated_answers.get(idx, '') if hasattr(self, 'generated_answers') else ''
 
+            # [FIX] reference_answer 추출 (ground_truth에서)
+            reference_answer = ''
+            if idx < len(ground_truths):
+                gt = ground_truths[idx]
+                reference_answer = gt if isinstance(gt, str) else str(gt) if gt else ''
+
+            # [FIX] reference 이미지 정보
+            ref_img_paths = reference_image_paths_list[idx] if idx < len(reference_image_paths_list) else []
+            ref_basenames = reference_basenames_list[idx] if idx < len(reference_basenames_list) else []
+
             samples_data.append({
                 'query': question,
                 'retrieved_images': retrieved_images,
                 'retrieved_basenames': retrieved_basenames,
                 'generated_answer': generated_answer,  # [Phase 6] NEW!
-                # 아래 필드들은 나중에 ray_trainer.py에서 채워질 예정
                 'response_str': '',
-                'reference_answer': '',
-                'reference_image_paths': [],
-                'reference_basenames': [],
+                'reference_answer': reference_answer,  # [FIX] ground_truth에서 가져옴
+                'reference_image_paths': ref_img_paths,
+                'reference_basenames': ref_basenames,
             })
 
         return samples_data
-
-
-
