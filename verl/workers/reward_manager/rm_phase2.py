@@ -61,6 +61,7 @@ import os
 import asyncio
 import threading
 import queue
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -131,6 +132,65 @@ LLM_RESPONSE_SCHEMA = {
 # =============================================================================
 # 헬퍼 함수: NDCG 계산
 # =============================================================================
+_NDCG_DEBUG_ENABLED = os.getenv("NDCG_DEBUG", "0").lower() in ("1", "true", "yes", "y")
+_NDCG_DEBUG_LOG_ALL = os.getenv("NDCG_DEBUG_LOG_ALL", "0").lower() in ("1", "true", "yes", "y")
+_NDCG_DEBUG_MAX_LINES = int(os.getenv("NDCG_DEBUG_MAX_LINES", "5000"))
+_NDCG_DEBUG_PATH = os.getenv("NDCG_DEBUG_PATH", "./logs/ndcg_debug_{pid}.jsonl").format(pid=os.getpid())
+_ndcg_debug_lock = threading.Lock()
+_ndcg_debug_lines = 0
+
+_FLASH_RM_LOG_ENABLED = os.getenv("FLASH_RM_LOG", "0").lower() in ("1", "true", "yes", "y")
+_FLASH_RM_LOG_MAX_LINES = int(os.getenv("FLASH_RM_LOG_MAX_LINES", "500000"))
+_FLASH_RM_LOG_PATH = os.getenv("FLASH_RM_LOG_PATH", "./logs/flash_rm_detail.jsonl")
+_flash_rm_log_lock = threading.Lock()
+_flash_rm_log_lines = 0
+
+
+def _ndcg_debug_write(payload: dict) -> None:
+    """Write one JSONL line for NDCG debugging (best-effort, bounded)."""
+    global _ndcg_debug_lines
+    if not _NDCG_DEBUG_ENABLED:
+        return
+    try:
+        with _ndcg_debug_lock:
+            if _ndcg_debug_lines >= _NDCG_DEBUG_MAX_LINES:
+                return
+            log_dir = os.path.dirname(_NDCG_DEBUG_PATH)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+            payload = dict(payload)
+            payload.setdefault("ts", time.time())
+            payload.setdefault("pid", os.getpid())
+            with open(_NDCG_DEBUG_PATH, "a") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            _ndcg_debug_lines += 1
+    except Exception:
+        # 로깅 실패는 학습을 멈추지 않게 한다.
+        return
+
+
+def _flash_rm_log_write(payload: dict) -> None:
+    """Write one JSONL line for Flash RM (Gemini Judge) debugging (best-effort, bounded)."""
+    global _flash_rm_log_lines
+    if not _FLASH_RM_LOG_ENABLED:
+        return
+    try:
+        with _flash_rm_log_lock:
+            if _flash_rm_log_lines >= _FLASH_RM_LOG_MAX_LINES:
+                return
+            log_dir = os.path.dirname(_FLASH_RM_LOG_PATH)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+            payload = dict(payload)
+            payload.setdefault("timestamp", time.time())
+            payload.setdefault("pid", os.getpid())
+            with open(_FLASH_RM_LOG_PATH, "a") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            _flash_rm_log_lines += 1
+    except Exception:
+        return
+
+
 def dcg(relevance_scores):
     """
     DCG (Discounted Cumulative Gain) 계산
@@ -165,6 +225,23 @@ def ndcg(sorted_docs, golden_answer_list):
     Returns:
         NDCG 값 (0.0 ~ 1.0)
     """
+    if not golden_answer_list:
+        _ndcg_debug_write({
+            "event": "ndcg",
+            "kind": "missing_golden",
+            "sorted_docs_len": len(sorted_docs) if sorted_docs is not None else None,
+            "golden_len": 0,
+            "sorted_docs_head": (list(sorted_docs)[:10] if sorted_docs is not None else None),
+        })
+        return 0.0
+
+    # Set 기반으로 히트 여부를 빠르게 계산 (로그에도 사용)
+    try:
+        golden_set = set(golden_answer_list)
+        hits = sum(1 for doc in sorted_docs if doc in golden_set)
+    except Exception:
+        hits = None
+
     # 각 문서가 정답에 포함되면 1, 아니면 0
     relevance_scores = [1 if doc in golden_answer_list else 0 for doc in sorted_docs]
 
@@ -177,9 +254,35 @@ def ndcg(sorted_docs, golden_answer_list):
 
     # 분모가 0인 경우 처리
     if idcg_value == 0:
+        _ndcg_debug_write({
+            "event": "ndcg",
+            "kind": "idcg_zero",
+            "sorted_docs_len": len(sorted_docs) if sorted_docs is not None else None,
+            "golden_len": len(golden_answer_list) if golden_answer_list is not None else None,
+            "hits": hits,
+            "sorted_docs_head": (list(sorted_docs)[:10] if sorted_docs is not None else None),
+            "golden_head": (list(golden_answer_list)[:10] if golden_answer_list is not None else None),
+        })
         return 0.0
 
-    return dcg_value / idcg_value
+    ndcg_value = dcg_value / idcg_value
+
+    # 디버그 로깅: ndcg==0인데 입력은 존재하는 케이스(스킴 불일치/매칭 실패)를 추적
+    if _NDCG_DEBUG_LOG_ALL or (ndcg_value == 0.0 and sorted_docs and golden_answer_list):
+        _ndcg_debug_write({
+            "event": "ndcg",
+            "kind": "computed",
+            "sorted_docs_len": len(sorted_docs) if sorted_docs is not None else None,
+            "golden_len": len(golden_answer_list) if golden_answer_list is not None else None,
+            "hits": hits,
+            "dcg": float(dcg_value),
+            "idcg": float(idcg_value),
+            "ndcg": float(ndcg_value),
+            "sorted_docs_head": (list(sorted_docs)[:10] if sorted_docs is not None else None),
+            "golden_head": (list(golden_answer_list)[:10] if golden_answer_list is not None else None),
+        })
+
+    return ndcg_value
 
 
 def get_answer_from_predict_str(text):
@@ -280,6 +383,13 @@ class RMManager:
         self.image_base_path = image_base_path
 
         # =========================================================================
+        # [NEW] Gemini Judge 상세 로깅 설정
+        # =========================================================================
+        self.gemini_detail_log_path = log_path.replace('.jsonl', '_gemini_detail.jsonl')
+        os.makedirs(os.path.dirname(self.gemini_detail_log_path) or '.', exist_ok=True)
+        print(f"[RMManager] Gemini Judge 상세 로그: {self.gemini_detail_log_path}")
+
+        # =========================================================================
         # 비동기 배치 처리 설정
         # =========================================================================
         # Gemini API rate limit 대응:
@@ -310,12 +420,24 @@ class RMManager:
             model_name=gemini_model,
             generation_config=self.generation_config
         )
+        # 워커별 이벤트 루프에서 안전하게 새 인스턴스를 만들기 위한 팩토리
+        self._gemini_factory = lambda: genai.GenerativeModel(
+            model_name=gemini_model,
+            generation_config=self.generation_config
+        )
 
         print(f"[RMManager] Gemini LLM Judge 초기화 완료: {gemini_model}")
         print(f"[RMManager] 평가 방식: <answer> 텍스트만 평가 (이미지 없음)")
         print(f"[RMManager] 점수 형식: 연속 점수 (0.0 ~ 1.0)")
         print(f"[RMManager] 비동기 배치 처리: 최대 {max_concurrent_requests}개 동시 요청")
         print(f"[RMManager] 로그 경로: {log_path}")
+        # 콘솔에 Gemini 프롬프트/응답을 모두 출력할지 여부 (디버그용)
+        # 0: quiet, 1: 요약(길이/스코어), 2: 전체 프롬프트/RAW 응답
+        _gemini_verbose = os.environ.get("GEMINI_DEBUG_VERBOSE", "0")
+        try:
+            self.verbose_gemini_level = int(_gemini_verbose)
+        except ValueError:
+            self.verbose_gemini_level = 1 if str(_gemini_verbose).lower() in ("1", "true", "t", "yes") else 0
 
         # =========================================================================
         # 스트리밍 모드 설정
@@ -629,13 +751,30 @@ class RMManager:
 
             # 2. Gemini API 호출 (재시도 대상)
             last_error = None
+            raw_response_text = None
 
             for attempt in range(max_retries):
                 try:
                     # 텍스트만 전송 (이미지 없음)
                     response = await self.gemini.generate_content_async(prompt)
-                    # 성공 시 즉시 반환
-                    return self._parse_llm_response(response.text)
+                    raw_response_text = response.text
+                    parsed_result = self._parse_llm_response(raw_response_text)
+
+                    # =========================================================
+                    # [NEW] Gemini Judge 상세 로깅 (성공 시)
+                    # =========================================================
+                    self._log_gemini_detail(
+                        idx=idx,
+                        query=item.get('query', ''),
+                        generated_answer=item.get('generated_answer', ''),
+                        reference_answer=item.get('reference_answer', ''),
+                        gemini_prompt=prompt,
+                        gemini_response=raw_response_text,
+                        parsed_score=parsed_result.get('score', 0.0),
+                        error=None
+                    )
+
+                    return parsed_result
 
                 except Exception as e:
                     last_error = e
@@ -651,8 +790,65 @@ class RMManager:
                         print(f"[RMManager] 샘플 {idx} 최종 실패 "
                               f"({max_retries}번 시도): {e}")
 
-            # 모든 재시도 실패 시 기본값 반환
+            # 모든 재시도 실패 시 상세 로깅 후 기본값 반환
+            self._log_gemini_detail(
+                idx=idx,
+                query=item.get('query', ''),
+                generated_answer=item.get('generated_answer', ''),
+                reference_answer=item.get('reference_answer', ''),
+                gemini_prompt=prompt,
+                gemini_response=raw_response_text,
+                parsed_score=0.0,
+                error=str(last_error)
+            )
             return self._default_result(f"max_retries_exceeded: {last_error}")
+
+    def _log_gemini_detail(
+        self,
+        idx: int,
+        query: str,
+        generated_answer: str,
+        reference_answer: str,
+        gemini_prompt: str,
+        gemini_response: Optional[str],
+        parsed_score: float,
+        error: Optional[str]
+    ):
+        """
+        [NEW] Gemini Judge 상세 로깅
+
+        입력 프롬프트와 출력 응답을 JSONL 파일과 콘솔에 기록합니다.
+        """
+        import datetime
+
+        log_entry = {
+            'timestamp': datetime.datetime.now().isoformat(),
+            'sample_idx': idx,
+            'query': query,
+            'generated_answer': generated_answer,
+            'reference_answer': reference_answer,
+            'gemini_prompt': gemini_prompt,
+            'gemini_response': gemini_response,
+            'parsed_score': parsed_score,
+            'error': error
+        }
+
+        # 콘솔 출력 (간략 버전)
+        status = "SUCCESS" if error is None else f"ERROR: {error}"
+        print(f"\n{'='*60}")
+        print(f"[Gemini Judge] Sample {idx} | Score: {parsed_score:.2f} | {status}")
+        print(f"  Query: {query[:100]}{'...' if len(query) > 100 else ''}")
+        print(f"  Generated: {generated_answer[:100]}{'...' if len(generated_answer) > 100 else ''}")
+        print(f"  Reference: {reference_answer[:100]}{'...' if len(reference_answer) > 100 else ''}")
+        print(f"  Gemini Response: {gemini_response[:200] if gemini_response else 'None'}{'...' if gemini_response and len(gemini_response) > 200 else ''}")
+        print(f"{'='*60}\n")
+
+        # JSONL 파일에 저장
+        try:
+            with open(self.gemini_detail_log_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+        except Exception as e:
+            print(f"[RMManager] Gemini 상세 로그 저장 실패: {e}")
 
     def _prepare_llm_input(self, item: dict) -> str:
         """
@@ -777,7 +973,7 @@ class RMManager:
     # 4. wait_and_get_streaming_rewards(): 모든 결과 수집
     # 5. stop_streaming_mode(): Worker 종료
 
-    def start_streaming_mode(self, num_worker_threads: int = 4):
+    def start_streaming_mode(self, num_worker_threads: int = 1):
         """
         스트리밍 모드 시작 - Generation 전에 호출
 
@@ -792,14 +988,15 @@ class RMManager:
             return
 
         self._streaming_mode = True
-        self._num_worker_threads = num_worker_threads
+        # Event loop 단일화: 워커 수를 1로 고정하고, 동시성은 세마포어로 제어
+        self._num_worker_threads = 1
         self._shutdown_event.clear()
         self._request_queue = queue.Queue()
         self._result_dict.clear()
         self._workers.clear()
 
         # Worker 스레드 시작
-        for i in range(num_worker_threads):
+        for i in range(self._num_worker_threads):
             worker = threading.Thread(
                 target=self._streaming_worker_loop,
                 name=f"StreamingRewardWorker-{i}",
@@ -839,11 +1036,19 @@ class RMManager:
             samples_data=samples_data
         )
         assert self._request_queue is not None, "Queue not initialized"
+
+        # [DEBUG] 제출되는 요청 상세 로깅
+        print(f"\n[DEBUG-RM] submit_prompt 호출됨: uid={uid}, indices={sample_indices}")
+        for i, data in enumerate(samples_data[:2]):  # 처음 2개만
+            print(f"  sample[{i}]: query={data.get('query', '')[:50]}...")
+            print(f"    generated_answer={data.get('generated_answer', 'MISSING')[:50] if data.get('generated_answer') else 'EMPTY'}...")
+            print(f"    reference_answer={data.get('reference_answer', '')[:50]}...")
+
         self._request_queue.put(request)
 
     def wait_and_get_streaming_rewards(
         self,
-        total_prompts: int,
+        total_prompts: int | None = None,
         timeout: float = 600.0
     ) -> Dict[str, PromptRewardResult]:
         """
@@ -863,20 +1068,56 @@ class RMManager:
             raise RuntimeError("스트리밍 모드가 활성화되지 않았습니다.")
 
         # Queue가 빌 때까지 대기 (모든 요청 처리 완료)
-        # join()은 queue가 empty가 될 때까지 blocking
+        # NOTE: queue.Queue.join()은 timeout을 지원하지 않아, 무한 대기 방지를 위해
+        # unfinished_tasks를 폴링하며 timeout을 구현한다.
         assert self._request_queue is not None, "Queue not initialized"
-        try:
-            self._request_queue.join()
-        except Exception as e:
-            print(f"[RMManager] Queue join 중 에러: {e}")
+        q = self._request_queue
+        start_t = time.monotonic()
+        warned = False
+
+        while True:
+            unfinished = getattr(q, "unfinished_tasks", 0)
+            if unfinished == 0:
+                break
+
+            elapsed = time.monotonic() - start_t
+            if elapsed >= timeout:
+                # 무한 대기 대신 현재까지의 결과라도 반환해 학습이 멈추지 않게 한다.
+                alive_workers = [w.name for w in self._workers if w.is_alive()]
+                with self._result_lock:
+                    completed_so_far = len(self._result_dict)
+                print(
+                    "[RMManager] 스트리밍 Reward 대기 timeout: "
+                    f"elapsed={elapsed:.1f}s, unfinished={unfinished}, "
+                    f"qsize~={q.qsize()}, completed={completed_so_far}, "
+                    f"alive_workers={alive_workers}"
+                )
+                break
+
+            # 너무 자주 출력하지 않도록 10초마다 1번만 경고
+            if not warned and elapsed >= 10.0:
+                alive_workers = [w.name for w in self._workers if w.is_alive()]
+                with self._result_lock:
+                    completed_so_far = len(self._result_dict)
+                print(
+                    "[RMManager] 스트리밍 Reward 대기 중... "
+                    f"elapsed={elapsed:.1f}s, unfinished={unfinished}, "
+                    f"qsize~={q.qsize()}, completed={completed_so_far}, "
+                    f"alive_workers={alive_workers}"
+                )
+                warned = True
+
+            time.sleep(0.1)
 
         with self._result_lock:
             completed = len(self._result_dict)
-            print(f"[RMManager] 스트리밍 완료: {completed}/{total_prompts} 프롬프트")
-
-            if completed < total_prompts:
-                print(f"[RMManager] 경고: 일부 프롬프트 결과 누락 "
-                      f"({total_prompts - completed}개)")
+            if total_prompts is None:
+                print(f"[RMManager] 스트리밍 완료: {completed} 프롬프트")
+            else:
+                print(f"[RMManager] 스트리밍 완료: {completed}/{total_prompts} 프롬프트")
+                if completed < total_prompts:
+                    print(f"[RMManager] 경고: 일부 프롬프트 결과 누락 "
+                          f"({total_prompts - completed}개)")
 
             return dict(self._result_dict)
 
@@ -886,21 +1127,17 @@ class RMManager:
 
         모든 Worker 스레드에 종료 신호를 보내고, 정리가 완료될 때까지 대기합니다.
         """
+        # 이벤트 루프/워크 플리핑으로 인한 gRPC 루프 충돌을 방지하기 위해
+        # 워커와 이벤트 루프는 유지하고, 큐/결과만 정리한다.
         if not self._streaming_mode:
             return
 
-        # 종료 신호 전송
-        self._shutdown_event.set()
+        # 큐와 결과를 비워 다음 스텝을 위한 깨끗한 상태만 유지
+        self._request_queue = queue.Queue()
+        with self._result_lock:
+            self._result_dict.clear()
 
-        # Worker 스레드 종료 대기
-        for worker in self._workers:
-            worker.join(timeout=5.0)
-            if worker.is_alive():
-                print(f"[RMManager] 경고: {worker.name} 종료 시간 초과")
-
-        self._workers.clear()
-        self._streaming_mode = False
-        print("[RMManager] 스트리밍 모드 종료")
+        print("[RMManager] 스트리밍 모드 유지: 워커는 계속 실행, 큐/결과만 초기화")
 
     def _streaming_worker_loop(self):
         """
@@ -912,6 +1149,8 @@ class RMManager:
         # 각 워커가 자체 이벤트 루프 생성 (스레드별로 별도 루프 필요)
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        # 이벤트 루프마다 안전하게 생성된 Gemini 클라이언트 사용
+        gemini_client = self._gemini_factory()
 
         worker_name = threading.current_thread().name
 
@@ -919,18 +1158,20 @@ class RMManager:
             while not self._shutdown_event.is_set():
                 # Queue가 초기화되지 않은 경우 스킵
                 if self._request_queue is None:
+                    time.sleep(0.05)
                     continue
 
                 try:
                     # 0.1초 타임아웃으로 종료 신호 확인 가능하게
-                    request = self._request_queue.get(timeout=0.1)
+                    request_queue = self._request_queue
+                    request = request_queue.get(timeout=0.1)
                 except queue.Empty:
                     continue
 
                 try:
                     # 비동기 평가 실행
                     result = loop.run_until_complete(
-                        self._evaluate_prompt_streaming(request)
+                        self._evaluate_prompt_streaming(request, gemini_client)
                     )
 
                     with self._result_lock:
@@ -945,15 +1186,19 @@ class RMManager:
 
                 finally:
                     # task_done() 호출로 join()이 완료 감지 가능
-                    if self._request_queue is not None:
-                        self._request_queue.task_done()
+                    try:
+                        request_queue.task_done()
+                    except Exception as e:
+                        # task_done 실패 시 worker 스레드가 죽어 join()이 영원히 블로킹되는 것을 방지
+                        print(f"[{worker_name}] task_done 실패: {e}")
 
         finally:
             loop.close()
 
     async def _evaluate_prompt_streaming(
         self,
-        request: PromptRewardRequest
+        request: PromptRewardRequest,
+        gemini_client
     ) -> PromptRewardResult:
         """
         프롬프트의 모든 샘플을 비동기 평가 (LLM as Judge 방식)
@@ -967,10 +1212,8 @@ class RMManager:
         Returns:
             프롬프트 단위 Reward 결과
         """
-        # 워커별로 세마포어 분배 (전체 동시 요청 수 / 워커 수)
-        semaphore = asyncio.Semaphore(
-            max(1, self.max_concurrent_requests // self._num_worker_threads)
-        )
+        # 단일 이벤트 루프에서 최대 동시 요청 수를 직접 세마포어로 제어
+        semaphore = asyncio.Semaphore(self.max_concurrent_requests)
 
         async def evaluate_single(sample_data: Dict, local_idx: int):
             """단일 샘플 평가 (클로저로 semaphore 공유)"""
@@ -978,12 +1221,31 @@ class RMManager:
                 # LLM 입력 준비 (텍스트만, 이미지 없음)
                 prompt = self._prepare_llm_input(sample_data)
 
+                # [DEBUG] 입력 데이터 확인
+                gen_ans = sample_data.get('generated_answer', '')
+                ref_ans = sample_data.get('reference_answer', '')
+                print(f"[DEBUG-RM] idx={local_idx} | gen_ans={gen_ans[:50] if gen_ans else 'EMPTY'}... | ref_ans={ref_ans[:50] if ref_ans else 'EMPTY'}...")
+                if self.verbose_gemini_level >= 1:
+                    print(f"[DEBUG-RM][GEMINI PROMPT idx={local_idx}] len={len(prompt)} chars")
+                if self.verbose_gemini_level >= 2:
+                    print(f"[DEBUG-RM][GEMINI PROMPT FULL idx={local_idx}]\\n{prompt}")
+
+                response_text = None
+                error_str = None
+                t0 = time.perf_counter()
                 try:
                     # 텍스트만 전송 (이미지 없음)
-                    response = await self.gemini.generate_content_async(prompt)
-                    judge_result = self._parse_llm_response(response.text)
+                    response = await gemini_client.generate_content_async(prompt)
+                    response_text = response.text
+                    judge_result = self._parse_llm_response(response_text)
+                    print(f"[DEBUG-RM] idx={local_idx} | Gemini 응답: score={judge_result.get('score', 'N/A')}")
+                    if self.verbose_gemini_level >= 2:
+                        print(f"[DEBUG-RM][GEMINI RESPONSE RAW idx={local_idx}] raw={response_text}")
                 except Exception as e:
-                    judge_result = self._default_result(str(e))
+                    print(f"[DEBUG-RM] idx={local_idx} | Gemini 오류: {e}")
+                    error_str = str(e)
+                    judge_result = self._default_result(error_str)
+                latency_s = time.perf_counter() - t0
 
                 # NDCG 계산
                 ndcg_value = ndcg(
@@ -991,13 +1253,60 @@ class RMManager:
                     sample_data.get('reference_basenames', [])
                 )
 
+                # NDCG 디버그: 호출 컨텍스트(uid/sample_idx)를 함께 남긴다 (조건부)
+                if _NDCG_DEBUG_ENABLED:
+                    try:
+                        sample_idx = None
+                        if 0 <= local_idx < len(request.sample_indices):
+                            sample_idx = request.sample_indices[local_idx]
+                        _ndcg_debug_write({
+                            "event": "ndcg_context",
+                            "uid": request.uid,
+                            "local_idx": local_idx,
+                            "sample_idx": sample_idx,
+                            "retrieved_len": len(sample_data.get("retrieved_basenames", []) or []),
+                            "golden_len": len(sample_data.get("reference_basenames", []) or []),
+                            "ndcg": float(ndcg_value),
+                            "retrieved_head": list(sample_data.get("retrieved_basenames", []) or [])[:10],
+                            "golden_head": list(sample_data.get("reference_basenames", []) or [])[:10],
+                        })
+                    except Exception:
+                        pass
+
                 # Judge 점수: 연속 점수 (0.0 ~ 1.0) 직접 사용
                 judge_score = judge_result.get('score', 0.0)
 
                 # 최종 점수: 0.8 * Judge + 0.2 * NDCG
                 final_score = 0.8 * judge_score + 0.2 * ndcg_value
+                # wandb 집계를 위해 final_score 키도 함께 저장
                 judge_result['final_score_combined'] = final_score
+                judge_result['final_score'] = final_score
                 judge_result['judge_score'] = judge_score
+
+                # Flash RM 상세 로깅 (Frozen generator detail과 유사한 JSONL)
+                if _FLASH_RM_LOG_ENABLED:
+                    try:
+                        sample_idx = None
+                        if 0 <= local_idx < len(request.sample_indices):
+                            sample_idx = request.sample_indices[local_idx]
+                        _flash_rm_log_write({
+                            "uid": request.uid,
+                            "local_idx": local_idx,
+                            "sample_idx": sample_idx,
+                            "query": sample_data.get("query", ""),
+                            "generated_answer": sample_data.get("generated_answer", ""),
+                            "reference_answer": sample_data.get("reference_answer", ""),
+                            "retrieved_basenames": list(sample_data.get("retrieved_basenames", []) or []),
+                            "reference_basenames": list(sample_data.get("reference_basenames", []) or []),
+                            "judge_score": float(judge_score) if judge_score is not None else None,
+                            "ndcg": float(ndcg_value),
+                            "final_score": float(final_score),
+                            "latency_s": float(latency_s),
+                            "gemini_raw": (response_text if response_text is not None else None),
+                            "error": error_str,
+                        })
+                    except Exception:
+                        pass
 
                 return local_idx, judge_result, ndcg_value
 

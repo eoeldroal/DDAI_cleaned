@@ -64,6 +64,7 @@ import os
 import asyncio
 import threading
 import queue
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -152,6 +153,35 @@ VLM_RESPONSE_SCHEMA = {
 # =============================================================================
 # 헬퍼 함수: NDCG 계산
 # =============================================================================
+_NDCG_DEBUG_ENABLED = os.getenv("NDCG_DEBUG", "0").lower() in ("1", "true", "yes", "y")
+_NDCG_DEBUG_LOG_ALL = os.getenv("NDCG_DEBUG_LOG_ALL", "0").lower() in ("1", "true", "yes", "y")
+_NDCG_DEBUG_MAX_LINES = int(os.getenv("NDCG_DEBUG_MAX_LINES", "5000"))
+_NDCG_DEBUG_PATH = os.getenv("NDCG_DEBUG_PATH", "./logs/ndcg_debug_{pid}.jsonl").format(pid=os.getpid())
+_ndcg_debug_lock = threading.Lock()
+_ndcg_debug_lines = 0
+
+
+def _ndcg_debug_write(payload: dict) -> None:
+    global _ndcg_debug_lines
+    if not _NDCG_DEBUG_ENABLED:
+        return
+    try:
+        with _ndcg_debug_lock:
+            if _ndcg_debug_lines >= _NDCG_DEBUG_MAX_LINES:
+                return
+            log_dir = os.path.dirname(_NDCG_DEBUG_PATH)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+            payload = dict(payload)
+            payload.setdefault("ts", time.time())
+            payload.setdefault("pid", os.getpid())
+            with open(_NDCG_DEBUG_PATH, "a") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            _ndcg_debug_lines += 1
+    except Exception:
+        return
+
+
 def dcg(relevance_scores):
     """
     DCG (Discounted Cumulative Gain) 계산
@@ -186,6 +216,22 @@ def ndcg(sorted_docs, golden_answer_list):
     Returns:
         NDCG 값 (0.0 ~ 1.0)
     """
+    if not golden_answer_list:
+        _ndcg_debug_write({
+            "event": "ndcg_traj",
+            "kind": "missing_golden",
+            "sorted_docs_len": len(sorted_docs) if sorted_docs is not None else None,
+            "golden_len": 0,
+            "sorted_docs_head": (list(sorted_docs)[:10] if sorted_docs is not None else None),
+        })
+        return 0.0
+
+    try:
+        golden_set = set(golden_answer_list)
+        hits = sum(1 for doc in sorted_docs if doc in golden_set)
+    except Exception:
+        hits = None
+
     # 각 문서가 정답에 포함되면 1, 아니면 0
     relevance_scores = [1 if doc in golden_answer_list else 0 for doc in sorted_docs]
 
@@ -198,9 +244,33 @@ def ndcg(sorted_docs, golden_answer_list):
 
     # 분모가 0인 경우 처리
     if idcg_value == 0:
+        _ndcg_debug_write({
+            "event": "ndcg_traj",
+            "kind": "idcg_zero",
+            "sorted_docs_len": len(sorted_docs) if sorted_docs is not None else None,
+            "golden_len": len(golden_answer_list) if golden_answer_list is not None else None,
+            "hits": hits,
+            "sorted_docs_head": (list(sorted_docs)[:10] if sorted_docs is not None else None),
+            "golden_head": (list(golden_answer_list)[:10] if golden_answer_list is not None else None),
+        })
         return 0.0
 
-    return dcg_value / idcg_value
+    ndcg_value = dcg_value / idcg_value
+    if _NDCG_DEBUG_LOG_ALL or (ndcg_value == 0.0 and sorted_docs and golden_answer_list):
+        _ndcg_debug_write({
+            "event": "ndcg_traj",
+            "kind": "computed",
+            "sorted_docs_len": len(sorted_docs) if sorted_docs is not None else None,
+            "golden_len": len(golden_answer_list) if golden_answer_list is not None else None,
+            "hits": hits,
+            "dcg": float(dcg_value),
+            "idcg": float(idcg_value),
+            "ndcg": float(ndcg_value),
+            "sorted_docs_head": (list(sorted_docs)[:10] if sorted_docs is not None else None),
+            "golden_head": (list(golden_answer_list)[:10] if golden_answer_list is not None else None),
+        })
+
+    return ndcg_value
 
 
 def get_answer_from_predict_str(text):
@@ -922,11 +992,43 @@ class RMManager:
             raise RuntimeError("스트리밍 모드가 활성화되지 않았습니다.")
 
         # Queue가 빌 때까지 대기 (모든 요청 처리 완료)
-        # join()은 queue가 empty가 될 때까지 blocking
-        try:
-            self._request_queue.join()
-        except Exception as e:
-            print(f"[RMManager] Queue join 중 에러: {e}")
+        # NOTE: queue.Queue.join()은 timeout을 지원하지 않아, 무한 대기 방지를 위해
+        # unfinished_tasks를 폴링하며 timeout을 구현한다.
+        q = self._request_queue
+        start_t = time.monotonic()
+        warned = False
+
+        while True:
+            unfinished = getattr(q, "unfinished_tasks", 0)
+            if unfinished == 0:
+                break
+
+            elapsed = time.monotonic() - start_t
+            if elapsed >= timeout:
+                alive_workers = [w.name for w in self._workers if w.is_alive()]
+                with self._result_lock:
+                    completed_so_far = len(self._result_dict)
+                print(
+                    "[RMManager] 스트리밍 Reward 대기 timeout: "
+                    f"elapsed={elapsed:.1f}s, unfinished={unfinished}, "
+                    f"qsize~={q.qsize()}, completed={completed_so_far}, "
+                    f"alive_workers={alive_workers}"
+                )
+                break
+
+            if not warned and elapsed >= 10.0:
+                alive_workers = [w.name for w in self._workers if w.is_alive()]
+                with self._result_lock:
+                    completed_so_far = len(self._result_dict)
+                print(
+                    "[RMManager] 스트리밍 Reward 대기 중... "
+                    f"elapsed={elapsed:.1f}s, unfinished={unfinished}, "
+                    f"qsize~={q.qsize()}, completed={completed_so_far}, "
+                    f"alive_workers={alive_workers}"
+                )
+                warned = True
+
+            time.sleep(0.1)
 
         with self._result_lock:
             completed = len(self._result_dict)
@@ -977,7 +1079,8 @@ class RMManager:
             while not self._shutdown_event.is_set():
                 try:
                     # 0.1초 타임아웃으로 종료 신호 확인 가능하게
-                    request = self._request_queue.get(timeout=0.1)
+                    request_queue = self._request_queue
+                    request = request_queue.get(timeout=0.1)
                 except queue.Empty:
                     continue
 
@@ -999,7 +1102,10 @@ class RMManager:
 
                 finally:
                     # task_done() 호출로 join()이 완료 감지 가능
-                    self._request_queue.task_done()
+                    try:
+                        request_queue.task_done()
+                    except Exception as e:
+                        print(f"[{worker_name}] task_done 실패: {e}")
 
         finally:
             loop.close()
