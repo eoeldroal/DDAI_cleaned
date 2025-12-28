@@ -350,6 +350,13 @@ class RayPPOTrainer(object):
         )
         if self.streaming_reward_enabled:
             print("[RayPPOTrainer] 스트리밍 Reward 모드 활성화")
+            self.streaming_reward_timeout = float(getattr(
+                getattr(config.reward_model, 'streaming_reward', None),
+                'timeout', 600.0
+            ))
+            print(f"[RayPPOTrainer] 스트리밍 Reward timeout={self.streaming_reward_timeout:.1f}s")
+        else:
+            self.streaming_reward_timeout = 600.0
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, 'Currently, only support hybrid engine'
@@ -805,7 +812,7 @@ class RayPPOTrainer(object):
                 # VLM 점수 추출
                 vlm_result = result.vlm_results[i]
                 if isinstance(vlm_result, dict):
-                    vlm_score = vlm_result.get('final_score', 0.0)
+                    vlm_score = vlm_result.get('judge_score', 0.0)
                     all_vlm_scores.append(vlm_score)
 
         # 메트릭 계산
@@ -863,6 +870,7 @@ class RayPPOTrainer(object):
             max_turns=self.config.max_turns,
             max_prompt_length=99999,
             num_gpus=self.config.trainer.n_gpus_per_node,
+            n_agent=self.config.actor_rollout_ref.rollout.n_agent,
             search_url = self.config.retriever.url,
             # [Phase 5] Frozen Generator 설정 (기본값은 GenerationConfig에서 제공)
             frozen_model=getattr(frozen_config, 'model', None) or "qwen2.5-vl-72b-instruct",
@@ -870,6 +878,12 @@ class RayPPOTrainer(object):
             frozen_max_concurrent=getattr(frozen_config, 'max_concurrent', None) or 50,
             frozen_max_retries=getattr(frozen_config, 'max_retries', None) or 3,
             frozen_backoff_base=getattr(frozen_config, 'backoff_base', None) or 1.5,
+            frozen_total_timeout=float(getattr(frozen_config, 'total_timeout', None) or 60.0),
+            frozen_async_wrapper_timeout=float(getattr(frozen_config, 'async_wrapper_timeout', None) or 60.0),
+            # [NEW] Search API 최적화 설정 반영 (환경 변수 우선)
+            search_batch_size=int(os.getenv("SEARCH_BATCH_SIZE", "32")),
+            search_max_workers=int(os.getenv("SEARCH_MAX_WORKERS", "16")),
+            search_timeout=int(os.getenv("SEARCH_TIMEOUT", "60")),
         )
 
         generation_manager = LLMGenerationManager(
@@ -910,16 +924,19 @@ class RayPPOTrainer(object):
                 gen_batch = batch.repeat_deepcopy(repeat_times=self.config.actor_rollout_ref.rollout.n_agent, interleave=True)
 
                 # pop those keys for generation
+                # [FIX] reward_model과 extra_info도 유지하여 스트리밍 모드에서 ground_truth 접근 가능
+                base_non_tensor_keys = ['id', 'raw_prompt_ids']
                 if 'multi_modal_inputs' in gen_batch.non_tensor_batch.keys():
-                    gen_batch = gen_batch.pop(
-                        batch_keys=['input_ids', 'attention_mask', 'position_ids'],
-                        non_tensor_batch_keys=['id','raw_prompt_ids', 'multi_modal_data', 'multi_modal_inputs'],
-                    )
-                else:
-                    gen_batch = gen_batch.pop(
-                        batch_keys=['input_ids', 'attention_mask', 'position_ids'],
-                        non_tensor_batch_keys=['id','raw_prompt_ids'],
-                    )
+                    base_non_tensor_keys.extend(['multi_modal_data', 'multi_modal_inputs'])
+                # 존재하는 키만 추가
+                for optional_key in ['reward_model', 'extra_info']:
+                    if optional_key in gen_batch.non_tensor_batch.keys():
+                        base_non_tensor_keys.append(optional_key)
+
+                gen_batch = gen_batch.pop(
+                    batch_keys=['input_ids', 'attention_mask', 'position_ids'],
+                    non_tensor_batch_keys=base_non_tensor_keys,
+                )
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
@@ -1014,10 +1031,24 @@ class RayPPOTrainer(object):
                         # [MODIFIED] 스트리밍 vs 배치 모드 분기
                         if self.streaming_reward_enabled:
                             # 스트리밍 모드: 결과 수집 및 텐서 변환
-                            num_prompts = self.config.data.train_batch_size
                             reward_results = self.reward_fn.wait_and_get_streaming_rewards(
-                                total_prompts=num_prompts
+                                total_prompts=None,
+                                timeout=self.streaming_reward_timeout,
                             )
+
+                            # [DEBUG] 스트리밍 결과 상세 로깅
+                            print(f"\n{'='*60}")
+                            print(f"[DEBUG] 스트리밍 Reward 결과 상세")
+                            print(f"[DEBUG] 수신된 프롬프트 수: {len(reward_results)}")
+                            for uid, result in list(reward_results.items())[:3]:  # 처음 3개만
+                                print(f"[DEBUG] uid={uid}")
+                                print(f"  - sample_indices: {result.sample_indices}")
+                                print(f"  - reward_scores: {result.reward_scores}")
+                                print(f"  - ndcg_values: {result.ndcg_values}")
+                                if hasattr(result, 'vlm_results'):
+                                    for i, vlm in enumerate(result.vlm_results[:2]):
+                                        print(f"  - vlm_result[{i}]: {vlm}")
+                            print(f"{'='*60}\n")
 
                             # 결과를 reward_tensor로 변환
                             reward_tensor, reward_metrics = self._convert_streaming_rewards_to_tensor(
@@ -1025,6 +1056,9 @@ class RayPPOTrainer(object):
                             )
                             batch.batch['token_level_scores'] = reward_tensor
                             metrics.update(reward_metrics)
+
+                            # [DEBUG] 최종 reward 메트릭 출력
+                            print(f"[DEBUG] WandB로 전송될 Reward 메트릭: {reward_metrics}")
 
                             # 워커 종료
                             self.reward_fn.stop_streaming_mode()
@@ -1215,7 +1249,10 @@ class RayPPOTrainer(object):
             max_turns=5,
             max_prompt_length=99999,
             num_gpus=self.config.trainer.n_gpus_per_node,
+            n_agent=self.config.actor_rollout_ref.rollout.n_agent,
             search_url = self.config.retriever.url,
+            frozen_total_timeout=float(getattr(frozen_config, 'total_timeout', None) or 60.0),
+            frozen_async_wrapper_timeout=float(getattr(frozen_config, 'async_wrapper_timeout', None) or 60.0),
         )
 
         generation_manager = LLMGenerationManager(
@@ -1312,10 +1349,6 @@ class RayPPOTrainer(object):
         metric_dict[f'val/test_score/overall'] = np.mean(overall_rewards)
         
         return metric_dict
-
-
-
-
 
 
 
