@@ -101,6 +101,131 @@ def _log_frozen_generator_detail(
         print(f"[Frozen Generator] 상세 로그 저장 실패: {e}")
 
 
+# =============================================================================
+# [NEW] Search 결과 상세 로깅 (NDCG 디버깅용)
+# =============================================================================
+_SEARCH_DEBUG_ENABLED = os.environ.get("SEARCH_DEBUG", "0") in ("1", "true", "True")
+_SEARCH_DEBUG_LOG_ALL = os.environ.get("SEARCH_DEBUG_LOG_ALL", "0") in ("1", "true", "True")
+_SEARCH_DEBUG_LOG_PATH = os.environ.get("SEARCH_DEBUG_PATH", os.path.join("./logs", "search_detail.jsonl"))
+try:
+    _SEARCH_DEBUG_MAX_LINES = int(os.environ.get("SEARCH_DEBUG_MAX_LINES", "5000"))
+except Exception:
+    _SEARCH_DEBUG_MAX_LINES = 5000
+
+_SEARCH_DEBUG_LINES = 0
+_SEARCH_DEBUG_LOCK = threading.Lock()
+os.makedirs(os.path.dirname(_SEARCH_DEBUG_LOG_PATH), exist_ok=True)
+
+def _basename_no_ext(path: Any) -> str:
+    try:
+        name = os.path.basename(str(path).rstrip("/"))
+        return os.path.splitext(name)[0]
+    except Exception:
+        return ""
+
+def _to_pages_for_debug(pages_val) -> List[int]:
+    if pages_val is None:
+        return []
+    if hasattr(pages_val, "tolist"):
+        pages_val = pages_val.tolist()
+    if isinstance(pages_val, (list, tuple)):
+        out = []
+        for v in pages_val:
+            try:
+                out.append(int(v))
+            except Exception:
+                continue
+        return out
+    try:
+        return [int(pages_val)]
+    except Exception:
+        return []
+
+def _debug_reference_basenames_from_gen_batch(gen_batch, idx: int, n_agent: int) -> List[str]:
+    if gen_batch is None:
+        return []
+    try:
+        raw_extra_infos = gen_batch.non_tensor_batch.get("extra_info", None)
+        extra_infos = [] if raw_extra_infos is None else list(raw_extra_infos)
+
+        def _map_to_prompt_index(i: int, prompt_len: int) -> int | None:
+            if prompt_len <= 0:
+                return None
+            if i < prompt_len:
+                return i
+            pi = i // max(int(n_agent or 1), 1)
+            if pi < prompt_len:
+                return pi
+            return None
+
+        ei_idx = _map_to_prompt_index(idx, len(extra_infos))
+        info = extra_infos[ei_idx] if (ei_idx is not None and ei_idx < len(extra_infos)) else None
+
+        if isinstance(info, dict):
+            ref_img_paths = info.get("reference_image_paths", None)
+            if ref_img_paths:
+                try:
+                    return [_basename_no_ext(p) for p in list(ref_img_paths)]
+                except Exception:
+                    pass
+
+        raw_file_names = gen_batch.non_tensor_batch.get("file_name", None)
+        if raw_file_names is None:
+            file_names = []
+        elif isinstance(raw_file_names, (list, tuple, np.ndarray)):
+            file_names = list(raw_file_names)
+        else:
+            file_names = [raw_file_names]
+
+        raw_reference_pages = gen_batch.non_tensor_batch.get("reference_page", None)
+        if raw_reference_pages is None:
+            reference_pages = []
+        elif isinstance(raw_reference_pages, (list, tuple, np.ndarray)):
+            reference_pages = list(raw_reference_pages)
+        else:
+            reference_pages = [raw_reference_pages]
+
+        fn_idx = _map_to_prompt_index(idx, len(file_names))
+        rp_idx = _map_to_prompt_index(idx, len(reference_pages))
+        file_name = file_names[fn_idx] if (fn_idx is not None and fn_idx < len(file_names)) else None
+        pages_val = reference_pages[rp_idx] if (rp_idx is not None and rp_idx < len(reference_pages)) else None
+
+        if isinstance(info, dict):
+            if not file_name:
+                file_name = info.get("file_name", None)
+            if pages_val is None:
+                pages_val = info.get("reference_page", None)
+
+        if not file_name:
+            return []
+        base = str(file_name).split(".pdf")[0]
+        pages = _to_pages_for_debug(pages_val)
+        return [f"{base}_{p}" for p in pages]
+    except Exception:
+        return []
+
+def _log_search_detail(entry: Dict[str, Any]) -> None:
+    global _SEARCH_DEBUG_LINES
+    if not _SEARCH_DEBUG_ENABLED:
+        return
+    if _SEARCH_DEBUG_MAX_LINES is not None and _SEARCH_DEBUG_LINES >= _SEARCH_DEBUG_MAX_LINES:
+        return
+    try:
+        line = json.dumps(entry, ensure_ascii=False)
+    except Exception:
+        line = json.dumps({"error": "json_dumps_failed", "pid": os.getpid()}, ensure_ascii=False)
+
+    try:
+        with _SEARCH_DEBUG_LOCK:
+            if _SEARCH_DEBUG_MAX_LINES is not None and _SEARCH_DEBUG_LINES >= _SEARCH_DEBUG_MAX_LINES:
+                return
+            with open(_SEARCH_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+            _SEARCH_DEBUG_LINES += 1
+    except Exception:
+        return
+
+
 class Phase2PerfTimer:
     """Phase 2 최적화 함수의 성능 측정을 위한 컨텍스트 매니저"""
 
@@ -498,6 +623,7 @@ class GenerationConfig:
     max_turns: int
     max_prompt_length: int
     num_gpus: int
+    n_agent: int = 8
     search_url: str = None
     #generator added
     crops_dir: str = "./agent_crops"
@@ -510,6 +636,9 @@ class GenerationConfig:
     frozen_backoff_base: float = 1.5
     # [Phase 5] OpenAI 비동기 API 설정
     frozen_max_concurrent: int = 50          # 동시 API 요청 수 (비동기 모드)
+    # Frozen Generator 시간 제한
+    frozen_total_timeout: float = 60.0       # 샘플/프롬프트 처리 총 시간 제한(초)
+    frozen_async_wrapper_timeout: float = 60.0  # asyncio.run 래핑/ThreadPool future timeout(초)
     # [NEW] 검색 최적화 옵션
     async_search: bool = True                # 비동기 병렬 검색 활성화
     search_batch_size: int = 32              # 검색 요청 배치 크기 (512 -> 32로 줄여서 동시성 확보)
@@ -861,6 +990,65 @@ class LLMGenerationManager:
                              input_images_list = [img_file_list[0]] # Fallback to first
                         else:
                              raise ValueError("No images returned from search")
+
+                    # [Debug] search 결과/선택/골든 rank 로깅 (NDCG=0 원인 분석)
+                    if _SEARCH_DEBUG_ENABLED:
+                        try:
+                            uid_val = None
+                            try:
+                                uid_val = rollings.non_tensor_batch.get("id", [None])[idx]
+                            except Exception:
+                                uid_val = None
+
+                            query_val = getattr(self, "_latest_search_queries", {}).get(idx, None)
+                            search_id_val = getattr(self, "_latest_search_ids", {}).get(idx, None)
+
+                            n_agent = int(getattr(self.config, "n_agent", 1) or 1)
+                            gen_batch = getattr(self, "_current_gen_batch", None)
+                            golden_basenames = _debug_reference_basenames_from_gen_batch(gen_batch, idx, n_agent)
+
+                            results_basenames = [_basename_no_ext(p) for p in img_file_list]
+                            chosen_image = input_images_list[0] if input_images_list else None
+                            chosen_basename = _basename_no_ext(chosen_image)
+
+                            golden_set = set(golden_basenames)
+                            golden_rank = None
+                            if golden_set:
+                                for r_idx, b in enumerate(results_basenames):
+                                    if b in golden_set:
+                                        golden_rank = r_idx
+                                        break
+                            chosen_rank = None
+                            if chosen_image is not None:
+                                try:
+                                    chosen_rank = img_file_list.index(chosen_image)
+                                except Exception:
+                                    chosen_rank = None
+
+                            chosen_is_golden = bool(chosen_basename and chosen_basename in golden_set)
+                            golden_in_results = golden_rank is not None
+
+                            if _SEARCH_DEBUG_LOG_ALL or (not chosen_is_golden) or (not golden_in_results):
+                                _log_search_detail({
+                                    "timestamp": datetime.now().isoformat(),
+                                    "pid": os.getpid(),
+                                    "uid": str(uid_val) if uid_val is not None else None,
+                                    "request_idx": idx,
+                                    "search_id": search_id_val,
+                                    "query": query_val,
+                                    "results_n": len(img_file_list),
+                                    "results_image_files": img_file_list,
+                                    "results_basenames": results_basenames,
+                                    "chosen_image_file": chosen_image,
+                                    "chosen_basename": chosen_basename,
+                                    "chosen_rank": chosen_rank,
+                                    "golden_basenames": golden_basenames,
+                                    "golden_rank": golden_rank,
+                                    "golden_in_results": golden_in_results,
+                                    "chosen_is_golden": chosen_is_golden,
+                                })
+                        except Exception:
+                            pass
 
                     raw_images_list = [process_image(image, 512*28*28, 256*28*28) for image in input_images_list]
                     image_inputs = self.processor.image_processor(raw_images_list, return_tensors='pt')
@@ -1381,6 +1569,9 @@ class LLMGenerationManager:
 
         meta_info = {}
 
+        # 배치 경계를 식별하기 위한 토큰 (백그라운드 스레드가 다음 배치 상태를 오염시키는 것 방지)
+        self._current_batch_uid = uuid.uuid4().hex
+
         # [FIX] gen_batch를 멤버로 저장하여 _collect_samples_data에서 ground_truth 접근 가능
         self._current_gen_batch = gen_batch
 
@@ -1389,6 +1580,12 @@ class LLMGenerationManager:
             self._init_prompt_tracking(gen_batch)
 
         # [Phase 6] 완전 비동기 스트리밍 상태 초기화
+        # NOTE: 이전 배치에서 남은 백그라운드 스레드가 있다면
+        # shared dict(self.generated_answers 등)를 오염시킬 수 있으므로 경고한다.
+        if self._pending_threads:
+            alive = [t.name for t in self._pending_threads if t.is_alive()]
+            if alive:
+                print(f"[Phase 6] 경고: 이전 배치의 FrozenGen 스레드가 아직 실행 중입니다: {alive}")
         self._pending_threads.clear()
         self.generated_answers.clear()
         self._streaming_frozen_generated.clear()
@@ -1643,11 +1840,24 @@ class LLMGenerationManager:
             print(f"[Phase 6] 백그라운드 스레드 대기 중... ({pending_count}개)")
             wait_start = _time.perf_counter()
 
-            for thread in self._pending_threads:
-                thread.join(timeout=120)  # 최대 2분 대기
+            # thread.join(timeout=...)를 스레드 개수만큼 순차로 호출하면
+            # "hung thread"가 여러 개일 때 대기 시간이 누적될 수 있다.
+            # 따라서 전체 대기 시간을 frozen_total_timeout으로 제한한다.
+            max_wait = float(getattr(self.config, "frozen_total_timeout", 60.0))
+            deadline = wait_start + max_wait
+
+            alive = [t for t in self._pending_threads if t.is_alive()]
+            while alive and _time.perf_counter() < deadline:
+                # 각 스레드를 짧게 join하여 종료를 유도 (전체 deadline 내에서 반복)
+                for t in alive:
+                    t.join(timeout=0.2)
+                alive = [t for t in alive if t.is_alive()]
 
             wait_elapsed = _time.perf_counter() - wait_start
-            print(f"[Phase 6] 백그라운드 스레드 완료: {pending_count}개, {wait_elapsed:.2f}초")
+            still_alive = [t.name for t in self._pending_threads if t.is_alive()]
+            if still_alive:
+                print(f"[Phase 6] 경고: FrozenGen 스레드가 timeout 내에 종료되지 않았습니다: {still_alive}")
+            print(f"[Phase 6] 백그라운드 스레드 대기 종료: total={pending_count}개, waited={wait_elapsed:.2f}초")
             self._pending_threads.clear()
 
         # [Phase 6] 스트리밍에서 이미 처리된 샘플 건너뛰기
@@ -1862,6 +2072,10 @@ class LLMGenerationManager:
         # 1. Search Request 수집
         search_requests = []
         search_indices = []
+        # [Debug] _process_next_obs에서 query를 로깅할 수 있도록 request_idx -> query 저장
+        # (NDCG=0 케이스 원인 분석: golden이 검색 결과에 있었는지/없었는지 확인)
+        self._latest_search_queries = {}
+        self._latest_search_ids = {}
         for i, (action, content) in enumerate(zip(cur_actions, contents)):
             if action == 'search':
                 m = _RE_UID_SUFFIX.search(str(uids[i]))
@@ -1872,6 +2086,8 @@ class LLMGenerationManager:
                     "request_idx": i
                 })
                 search_indices.append(i)
+                self._latest_search_queries[i] = content
+                self._latest_search_ids[i] = search_id
 
         # 2. Search Task 시작 (Non-blocking)
         search_task = None
@@ -2170,7 +2386,7 @@ class LLMGenerationManager:
                     messages=messages,
                     max_tokens=int(getattr(self.config, "frozen_max_tokens", 256)),
                 )
-            except Exception:
+            except Exception as e:
                 print(f"🚨 [API ERROR] Question: {question[:30]}... | Error: {e}")  # 디버깅
                 return (0, "")
 
@@ -2180,7 +2396,7 @@ class LLMGenerationManager:
                 return (200, text)
             
             return (int(code) if isinstance(code, HTTPStatus) else (code or 0), "")
-        except Exception:
+        except Exception as e:
             print(f"🚨 오류: API 호출 중 에러 발생: {e}") # 디버깅
             return (0, "")
 
@@ -2308,6 +2524,7 @@ class LLMGenerationManager:
         asyncio.run() 또는 기존 이벤트 루프에서 실행합니다.
         """
         try:
+            wrapper_timeout = float(getattr(self.config, "frozen_async_wrapper_timeout", 60.0))
             # 기존 이벤트 루프가 있는지 확인
             try:
                 loop = asyncio.get_running_loop()
@@ -2325,14 +2542,29 @@ class LLMGenerationManager:
                             indices, questions, images_list
                         )
                     )
-                    return future.result(timeout=300)  # 5분 타임아웃
+                    try:
+                        return future.result(timeout=wrapper_timeout)
+                    except concurrent.futures.TimeoutError:
+                        _phase2_logger.warning(
+                            f"[Phase5] Async batch wrapper timeout({wrapper_timeout:.1f}s). "
+                            "Returning empty answers for this prompt."
+                        )
+                        return {i: "" for i in indices}
             else:
                 # 이벤트 루프가 없는 경우 직접 실행
-                return asyncio.run(
-                    self._call_frozen_generator_batch_async(
-                        indices, questions, images_list
+                try:
+                    return asyncio.run(
+                        asyncio.wait_for(
+                            self._call_frozen_generator_batch_async(indices, questions, images_list),
+                            timeout=wrapper_timeout
+                        )
                     )
-                )
+                except asyncio.TimeoutError:
+                    _phase2_logger.warning(
+                        f"[Phase5] Async batch asyncio.run timeout({wrapper_timeout:.1f}s). "
+                        "Returning empty answers for this prompt."
+                    )
+                    return {i: "" for i in indices}
         except Exception as e:
             _phase2_logger.warning(f"[Phase5] Async batch failed, falling back to sync: {e}")
             return self._call_frozen_generator_batch_sync(indices, questions, images_list)
@@ -2370,10 +2602,15 @@ class LLMGenerationManager:
             f"max_concurrent={max_concurrent}"
         )
 
+        total_timeout = float(getattr(self.config, "frozen_total_timeout", 60.0))
+
         async def _single_with_retry(idx: int, q: str, paths: List[str]) -> Tuple[int, str]:
             """재시도 로직이 포함된 단일 비동기 호출"""
+            started = _time.perf_counter()
             delay = 0.0
             for attempt in range(max_retries):
+                if (_time.perf_counter() - started) >= total_timeout:
+                    break
                 if delay > 0:
                     await asyncio.sleep(delay)
 
@@ -2411,6 +2648,9 @@ class LLMGenerationManager:
                 # 재시도 가능한 오류
                 if code in (429, 500, 502, 503, 504, 408, 0):
                     delay = (backoff_base ** attempt) + _random.uniform(0, 0.3)
+                    # 남은 예산을 초과하면 더 이상 재시도하지 않음
+                    if (_time.perf_counter() - started + delay) >= total_timeout:
+                        break
                     continue
 
                 # 기타 오류는 빈 결과 반환
@@ -2478,7 +2718,7 @@ class LLMGenerationManager:
         프롬프트의 모든 샘플이 완료되면 Reward 계산을 시작합니다.
         """
         uids = gen_batch.non_tensor_batch.get('uid', gen_batch.non_tensor_batch.get('id', []))
-        n_agent = getattr(self.config, 'n_agent', 8)  # 기본값 8
+        n_agent = self.config.n_agent
 
         batch_size = len(uids)
         num_prompts = batch_size // n_agent
@@ -2515,7 +2755,7 @@ class LLMGenerationManager:
         Args:
             sample_idx: 완료된 샘플의 배치 내 인덱스
         """
-        n_agent = getattr(self.config, 'n_agent', 8)
+        n_agent = self.config.n_agent
         prompt_idx = sample_idx // n_agent
 
         # 프롬프트 ID 찾기
@@ -2536,7 +2776,7 @@ class LLMGenerationManager:
             indices = list(status['sample_indices'])  # 복사본 생성
             thread = threading.Thread(
                 target=self._process_prompt_background,
-                args=(indices, prompt_id, status),
+                args=(indices, prompt_id, status, self._current_batch_uid),
                 daemon=True,
                 name=f"FrozenGen-{prompt_id}"
             )
@@ -2547,7 +2787,7 @@ class LLMGenerationManager:
             print(f"[Phase 6] 프롬프트 {prompt_id} 백그라운드 처리 시작 "
                   f"(샘플 {len(indices)}개)")
 
-    def _process_prompt_background(self, indices: List[int], prompt_id: str, status: dict):
+    def _process_prompt_background(self, indices: List[int], prompt_id: str, status: dict, batch_uid: str):
         """
         [Phase 6] 백그라운드 스레드에서 Frozen Generator + Reward 처리
 
@@ -2581,6 +2821,9 @@ class LLMGenerationManager:
 
             # 3. 결과 저장 (Thread-safe)
             with self._thread_lock:
+                # 다음 배치로 넘어간 뒤 늦게 도착한 결과는 버린다 (상태 오염 방지)
+                if batch_uid != getattr(self, "_current_batch_uid", None):
+                    return
                 for i in indices:
                     answer = index2answer.get(i, "")
                     self.generated_answers[i] = answer
@@ -2592,6 +2835,8 @@ class LLMGenerationManager:
             samples_data = self._collect_samples_data(indices)
 
             # 5. Reward 제출 (Gemini VLM Judge 호출)
+            if batch_uid != getattr(self, "_current_batch_uid", None):
+                return
             self.streaming_reward_manager.submit_prompt(
                 uid=prompt_id,
                 sample_indices=indices,
@@ -2629,8 +2874,9 @@ class LLMGenerationManager:
         # [FIX] gen_batch에서 ground_truth 정보 가져오기
         gen_batch = getattr(self, '_current_gen_batch', None)
         ground_truths = []
-        reference_image_paths_list = []
-        reference_basenames_list = []
+        extra_infos = []
+        file_names = []
+        reference_pages = []
 
         if gen_batch is not None:
             try:
@@ -2645,21 +2891,60 @@ class LLMGenerationManager:
                         for item in reward_model_data
                     ]
 
-                # extra_info에서 reference 이미지 정보 가져오기
-                extra_infos = gen_batch.non_tensor_batch.get('extra_info', [])
-                for info in extra_infos:
-                    if isinstance(info, dict):
-                        ref_paths = info.get('reference_image_paths', [])
-                        reference_image_paths_list.append(ref_paths)
-                        reference_basenames_list.append([
-                            os.path.basename(p.rstrip('/')).split(".jpg")[0]
-                            for p in ref_paths
-                        ])
-                    else:
-                        reference_image_paths_list.append([])
-                        reference_basenames_list.append([])
+                # extra_info에서 file_name/reference_page를 가져와 NDCG golden(basenames)을 구성한다.
+                # (데이터셋 extra_info에 reference_image_paths가 없을 수 있음)
+                raw_extra_infos = gen_batch.non_tensor_batch.get('extra_info', [])
+                extra_infos = [] if raw_extra_infos is None else list(raw_extra_infos)
+
+                # gen_batch에는 보통 file_name/reference_page가 직접 포함되지 않고,
+                # extra_info 내부에만 있을 수 있다. (있다면 보조적으로 사용)
+                raw_file_names = gen_batch.non_tensor_batch.get('file_name', None)
+                if raw_file_names is None:
+                    file_names = []
+                elif isinstance(raw_file_names, (list, tuple, np.ndarray)):
+                    file_names = list(raw_file_names)
+                else:
+                    file_names = [raw_file_names]
+
+                raw_reference_pages = gen_batch.non_tensor_batch.get('reference_page', None)
+                if raw_reference_pages is None:
+                    reference_pages = []
+                elif isinstance(raw_reference_pages, (list, tuple, np.ndarray)):
+                    reference_pages = list(raw_reference_pages)
+                else:
+                    reference_pages = [raw_reference_pages]
             except Exception as e:
                 print(f"[WARNING] ground_truth 추출 실패: {e}")
+
+        n_agent = int(getattr(self.config, "n_agent", 1) or 1)
+
+        def _map_to_prompt_index(i: int, prompt_len: int) -> int | None:
+            if prompt_len <= 0:
+                return None
+            if i < prompt_len:
+                return i
+            pi = i // n_agent
+            if pi < prompt_len:
+                return pi
+            return None
+
+        def _to_pages(pages_val) -> List[int]:
+            if pages_val is None:
+                return []
+            if hasattr(pages_val, "tolist"):
+                pages_val = pages_val.tolist()
+            if isinstance(pages_val, (list, tuple)):
+                out = []
+                for v in pages_val:
+                    try:
+                        out.append(int(v))
+                    except Exception:
+                        continue
+                return out
+            try:
+                return [int(pages_val)]
+            except Exception:
+                return []
 
         for idx in indices:
             # 검색된 이미지 경로
@@ -2679,13 +2964,44 @@ class LLMGenerationManager:
 
             # [FIX] reference_answer 추출 (ground_truth에서)
             reference_answer = ''
-            if idx < len(ground_truths):
-                gt = ground_truths[idx]
+            prompt_idx = _map_to_prompt_index(idx, len(ground_truths))
+            if prompt_idx is not None:
+                gt = ground_truths[prompt_idx]
                 reference_answer = gt if isinstance(gt, str) else str(gt) if gt else ''
 
-            # [FIX] reference 이미지 정보
-            ref_img_paths = reference_image_paths_list[idx] if idx < len(reference_image_paths_list) else []
-            ref_basenames = reference_basenames_list[idx] if idx < len(reference_basenames_list) else []
+            # [FIX] reference basenames 정보 (NDCG golden)
+            ref_basenames: List[str] = []
+            ref_img_paths: List[str] = []
+
+            # 1) extra_info.reference_image_paths가 있으면 우선 사용
+            ei_idx = _map_to_prompt_index(idx, len(extra_infos))
+            info = extra_infos[ei_idx] if (ei_idx is not None and ei_idx < len(extra_infos)) else None
+            if isinstance(info, dict):
+                ref_img_paths = list(info.get('reference_image_paths', []) or [])
+                if ref_img_paths:
+                    ref_basenames = [
+                        os.path.basename(p.rstrip('/')).split(".jpg")[0]
+                        for p in ref_img_paths
+                    ]
+
+            # 2) 없으면 file_name/reference_page로 basenames 생성
+            if not ref_basenames:
+                fn_idx = _map_to_prompt_index(idx, len(file_names))
+                rp_idx = _map_to_prompt_index(idx, len(reference_pages))
+                file_name = file_names[fn_idx] if (fn_idx is not None and fn_idx < len(file_names)) else None
+                pages_val = reference_pages[rp_idx] if (rp_idx is not None and rp_idx < len(reference_pages)) else None
+
+                if isinstance(info, dict):
+                    if not file_name:
+                        file_name = info.get("file_name", None)
+                    # numpy array의 truthiness를 피하기 위해 or 사용 금지
+                    if pages_val is None:
+                        pages_val = info.get("reference_page", None)
+
+                if file_name:
+                    base = str(file_name).split(".pdf")[0]
+                    pages = _to_pages(pages_val)
+                    ref_basenames = [f"{base}_{p}" for p in pages]
 
             samples_data.append({
                 'query': question,
@@ -2696,6 +3012,9 @@ class LLMGenerationManager:
                 'reference_answer': reference_answer,  # [FIX] ground_truth에서 가져옴
                 'reference_image_paths': ref_img_paths,
                 'reference_basenames': ref_basenames,
+                # 디버깅/호환을 위해 원본 메타도 함께 전달
+                'file_name': (info.get("file_name") if isinstance(info, dict) else None),
+                'reference_page': (info.get("reference_page") if isinstance(info, dict) else None),
             })
 
         return samples_data
