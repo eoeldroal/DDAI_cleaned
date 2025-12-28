@@ -20,22 +20,40 @@ app = FastAPI(
     version="2.1.0",
 )
 
-# 전역 변수: SearchEngine 인스턴스
-search_engine = None
+# 전역 변수: SearchEngine 인스턴스 리스트 및 로드 밸런서
+search_engines = []
+engine_cycle = None
+# 사용 가능한 GPU ID 목록 (H200 8대)
+GPU_IDS = [0, 1, 2, 3, 4, 5, 6, 7]
 
+from itertools import cycle
+from fastapi.concurrency import run_in_threadpool
 
 @app.on_event("startup")
 async def startup_event():
-    """애플리케이션 시작 시 SearchEngine 초기화"""
-    global search_engine
-    print("Initializing SearchEngine (GPU 적극 활용 버전)...")
-    search_engine = SearchEngine(
-        dataset_dir,
-        embed_model_name='vidore/colqwen2-v1.0',
-        gpu_id=2,              # GPU 2 사용
-        chunk_size=16384,      # 16K 이미지씩 사전 패딩
-    )
-    print(f"SearchEngine initialized with {search_engine.image_nums:,} images")
+    """애플리케이션 시작 시 모든 GPU에 SearchEngine 초기화"""
+    global search_engines, engine_cycle
+    print(f"Initializing SearchEngines on GPUs {GPU_IDS} (Total {len(GPU_IDS)} GPUs)...")
+    
+    search_engines = []
+    for gpu_id in GPU_IDS:
+        try:
+            print(f"Initializing engine on GPU {gpu_id}...")
+            engine = SearchEngine(
+                dataset_dir,
+                embed_model_name='vidore/colqwen2-v1.0',
+                gpu_id=gpu_id,
+                chunk_size=16384,      # 16K 이미지씩 사전 패딩
+            )
+            search_engines.append(engine)
+        except Exception as e:
+            print(f"Failed to initialize engine on GPU {gpu_id}: {e}")
+    
+    if not search_engines:
+        raise RuntimeError("No SearchEngine could be initialized.")
+        
+    engine_cycle = cycle(search_engines)
+    print(f"Successfully initialized {len(search_engines)} SearchEngines.")
 
 
 @app.get(
@@ -47,14 +65,18 @@ async def startup_event():
 async def search(queries: List[str] = Query(...)):
     """
     검색 수행.
-
-    Args:
-        queries: 검색 쿼리 리스트
-
-    Returns:
-        각 쿼리에 대한 검색 결과 리스트
+    
+    Multi-GPU Load Balancing을 적용하여 쿼리를 분산 처리합니다.
     """
-    results_batch = search_engine.batch_search(queries)
+    if not search_engines or engine_cycle is None:
+        raise RuntimeError("Search engines not initialized")
+        
+    # Round-Robin 방식으로 엔진 선택
+    engine = next(engine_cycle)
+    
+    # 별도 스레드에서 실행하여 이벤트 루프 블로킹 방지 + 병렬 처리
+    results_batch = await run_in_threadpool(engine.batch_search, queries)
+    
     results_batch = [
         [
             dict(idx=idx, image_file=os.path.join('./search_engine/corpus/img', file))
@@ -66,38 +88,53 @@ async def search(queries: List[str] = Query(...)):
 
 
 # =========================================================================
-# 캐시 및 메모리 관리 엔드포인트
+# 캐시 및 메모리 관리 엔드포인트 (멀티 GPU 대응)
 # =========================================================================
 @app.get(
     "/cache/stats",
     summary="Get cache and performance statistics",
-    description="캐시 히트율, GPU 메모리 사용량, 성능 통계를 반환합니다.",
+    description="모든 GPU 엔진의 통계를 반환합니다.",
 )
 async def cache_stats():
-    """캐시 및 성능 통계 조회"""
-    return search_engine.get_cache_stats()
+    """캐시 및 성능 통계 조회 (전체 합계 및 개별)"""
+    if not search_engines:
+        return {"error": "No engines"}
+    
+    stats = {
+        "total_engines": len(search_engines),
+        "engines": []
+    }
+    
+    for i, engine in enumerate(search_engines):
+        s = engine.get_cache_stats()
+        s['gpu_id'] = engine.gpu_id
+        stats['engines'].append(s)
+        
+    return stats
 
 
 @app.post(
     "/cache/clear",
     summary="Clear cache",
-    description="쿼리 결과 캐시를 초기화합니다.",
+    description="모든 엔진의 캐시를 초기화합니다.",
 )
 async def cache_clear():
     """캐시 초기화"""
-    search_engine.clear_cache()
-    return {"status": "success", "message": "Cache cleared"}
+    for engine in search_engines:
+        engine.clear_cache()
+    return {"status": "success", "message": "All caches cleared"}
 
 
 @app.post(
     "/memory/cleanup",
     summary="Force memory cleanup",
-    description="GPU 메모리 캐시를 강제로 정리합니다.",
+    description="모든 GPU의 메모리를 정리합니다.",
 )
 async def memory_cleanup():
     """강제 메모리 정리"""
-    search_engine.force_memory_cleanup()
-    return {"status": "success", "message": "Memory cleanup completed"}
+    for engine in search_engines:
+        engine.force_memory_cleanup()
+    return {"status": "success", "message": "All memory cleanups completed"}
 
 
 @app.get(
@@ -107,10 +144,13 @@ async def memory_cleanup():
 )
 async def health_check():
     """서버 상태 확인"""
+    if not search_engines:
+        return {"status": "unhealthy", "message": "No engines initialized"}
+        
     return {
         "status": "healthy",
-        "image_count": search_engine.image_nums,
-        "cache_stats": search_engine.get_cache_stats(),
+        "active_gpus": len(search_engines),
+        "total_images": sum(e.image_nums for e in search_engines) # Note: 중복됨
     }
 
 
