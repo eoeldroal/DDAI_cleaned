@@ -69,6 +69,9 @@ from typing import Dict, List, Optional
 # Gemini SDK
 import google.generativeai as genai
 
+from verl.utils.unified_logger import get_unified_logger
+
+_UNIFIED_LOGGER = get_unified_logger()
 
 # =============================================================================
 # LLM Judge 프롬프트
@@ -151,6 +154,14 @@ def _ndcg_debug_write(payload: dict) -> None:
     global _ndcg_debug_lines
     if not _NDCG_DEBUG_ENABLED:
         return
+    # Unified log (single-file)
+    try:
+        _UNIFIED_LOGGER.log_event({**payload, "event_type": "rm.ndcg.debug"})
+    except Exception:
+        pass
+    # (legacy) JSONL 파일에 저장: unified 로깅 사용 시 중복되므로 기본 비활성화
+    if _UNIFIED_LOGGER.enabled:
+        return
     try:
         with _ndcg_debug_lock:
             if _ndcg_debug_lines >= _NDCG_DEBUG_MAX_LINES:
@@ -174,6 +185,16 @@ def _flash_rm_log_write(payload: dict) -> None:
     global _flash_rm_log_lines
     if not _FLASH_RM_LOG_ENABLED:
         return
+    # Unified log (single-file)
+    try:
+        _UNIFIED_LOGGER.log_event({**payload, "event_type": "rm.flash.detail"})
+    except Exception:
+        pass
+
+    # (legacy) JSONL 파일에 저장: unified 로깅 사용 시 중복되므로 기본 비활성화
+    if _UNIFIED_LOGGER.enabled:
+        return
+
     try:
         with _flash_rm_log_lock:
             if _flash_rm_log_lines >= _FLASH_RM_LOG_MAX_LINES:
@@ -399,6 +420,13 @@ class RMManager:
         self.max_concurrent_requests = max_concurrent_requests
 
         # =========================================================================
+        # [NEW] Reward Coefficients 설정 (환경 변수)
+        # =========================================================================
+        self.judge_coef = float(os.getenv("RM_JUDGE_COEF", "0.8"))
+        self.ndcg_coef = float(os.getenv("RM_NDCG_COEF", "0.2"))
+        print(f"[RMManager] Reward Coefficients: Judge={self.judge_coef}, NDCG={self.ndcg_coef}")
+
+        # =========================================================================
         # Gemini SDK 초기화 (Structured Output 설정)
         # =========================================================================
         # 환경 변수에서 API 키 로드
@@ -585,7 +613,11 @@ class RMManager:
             # -----------------------------------------------------------------
             # 4.3 최종 점수 계산: 0.8 * Judge + 0.2 * NDCG
             # -----------------------------------------------------------------
-            final_score = 0.8 * judge_score + 0.2 * ndcg_value
+            # Final score: coef * judge + coef * ndcg (env: RM_JUDGE_COEF / RM_NDCG_COEF)
+            try:
+                final_score = self.judge_coef * float(judge_score) + self.ndcg_coef * float(ndcg_value)
+            except Exception:
+                final_score = 0.0
 
             # -----------------------------------------------------------------
             # 4.4 reward_tensor에 할당
@@ -617,9 +649,18 @@ class RMManager:
         # =========================================================================
         # 기존: 전체 파일 읽기 → 수정 → 전체 쓰기 (O(n))
         # 개선: append 모드로 추가만 (O(1))
-        with open(self.log_path, 'a') as f:
+        # (legacy) JSONL 로그 저장: unified 로깅 사용 시 중복되므로 기본 비활성화
+        if not _UNIFIED_LOGGER.enabled:
+            with open(self.log_path, 'a') as f:
+                for entry in log_entries:
+                    f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+        else:
+            # Unified log: batch-mode RM summary (per-sample)
             for entry in log_entries:
-                f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+                try:
+                    _UNIFIED_LOGGER.log_event({**entry, "event_type": "rm.batch.summary"})
+                except Exception:
+                    pass
 
         # =========================================================================
         # 6. 평균 메트릭 계산 및 반환
@@ -833,6 +874,12 @@ class RMManager:
             'error': error
         }
 
+        # Unified log (single-file)
+        try:
+            _UNIFIED_LOGGER.log_event({**log_entry, "event_type": "rm.gemini.detail"})
+        except Exception:
+            pass
+
         # 콘솔 출력 (간략 버전)
         status = "SUCCESS" if error is None else f"ERROR: {error}"
         print(f"\n{'='*60}")
@@ -843,12 +890,13 @@ class RMManager:
         print(f"  Gemini Response: {gemini_response[:200] if gemini_response else 'None'}{'...' if gemini_response and len(gemini_response) > 200 else ''}")
         print(f"{'='*60}\n")
 
-        # JSONL 파일에 저장
-        try:
-            with open(self.gemini_detail_log_path, 'a', encoding='utf-8') as f:
-                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
-        except Exception as e:
-            print(f"[RMManager] Gemini 상세 로그 저장 실패: {e}")
+        # (legacy) JSONL 파일에 저장: unified 로깅 사용 시 중복되므로 기본 비활성화
+        if not _UNIFIED_LOGGER.enabled:
+            try:
+                with open(self.gemini_detail_log_path, 'a', encoding='utf-8') as f:
+                    f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+            except Exception as e:
+                print(f"[RMManager] Gemini 상세 로그 저장 실패: {e}")
 
     def _prepare_llm_input(self, item: dict) -> str:
         """
@@ -1277,7 +1325,12 @@ class RMManager:
                 judge_score = judge_result.get('score', 0.0)
 
                 # 최종 점수: 0.8 * Judge + 0.2 * NDCG
-                final_score = 0.8 * judge_score + 0.2 * ndcg_value
+                # Final score: coef * judge + coef * ndcg (env: RM_JUDGE_COEF / RM_NDCG_COEF)
+                try:
+                    final_score = self.judge_coef * float(judge_score) + self.ndcg_coef * float(ndcg_value)
+                except Exception:
+                    final_score = 0.0
+                
                 # wandb 집계를 위해 final_score 키도 함께 저장
                 judge_result['final_score_combined'] = final_score
                 judge_result['final_score'] = final_score

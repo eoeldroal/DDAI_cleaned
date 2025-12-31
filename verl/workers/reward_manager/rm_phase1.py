@@ -14,6 +14,7 @@
 
 from verl import DataProto
 from verl.utils.reward_score import _default_compute_score
+from verl.utils.unified_logger import get_unified_logger
 import torch
 import json
 import requests
@@ -21,6 +22,8 @@ import math
 import numpy as np
 import os
 import re #added
+
+_UNIFIED_LOGGER = get_unified_logger()
 def dcg(relevance_scores):
     """
     计算折扣累积增益（DCG）
@@ -124,7 +127,7 @@ class RMManager:
 
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
         if 'rm_scores' in data.batch.keys():
-            return data.batch['rm_scores']
+            return data.batch['rm_scores'], {}
 
         
         #로그에 학습 step 추가
@@ -137,22 +140,27 @@ class RMManager:
 
         already_print_data_sources = {}
 
-        #수정 추가: log 작성#
-        if os.path.exists(self.log_path):
-            with open(self.log_path, "r") as f:
-                try:
-                    log_data = json.load(f)
-                except json.JSONDecodeError:
-                    log_data = {}
-        else:
-            log_data = {}
-        #수정 추가 끝
+        # Metrics (returned to trainer/W&B)
+        format_scores = []
+        ndcg_scores = []
+        final_scores = []
 
-        # log 학습 step 추기
-        if step_key not in log_data:
-            log_data[step_key] = {}
-        log_data_for_step = log_data[step_key]
-        #//
+        # (legacy) structured logging: unified 로깅 사용 시 중복/병목이므로 비활성화
+        log_data = {}
+        log_data_for_step = {}
+        if not _UNIFIED_LOGGER.enabled:
+            if os.path.exists(self.log_path):
+                with open(self.log_path, "r") as f:
+                    try:
+                        log_data = json.load(f)
+                    except json.JSONDecodeError:
+                        log_data = {}
+            else:
+                log_data = {}
+
+            if step_key not in log_data:
+                log_data[step_key] = {}
+            log_data_for_step = log_data[step_key]
 
         #각 답안지에서 '문제', '학생 답', '정답'을 깔끔하게 정리해서 '외부 채점 위원에게 보낼 서류 묶음'(data_eval)을 만듭니다.
 
@@ -216,8 +224,26 @@ class RMManager:
             ################수정(주석 처리) ################    
             #log 작성      
             
-            retrievaled_images_basename_list = [os.path.basename(item.rstrip('/')).split(".jpg")[0] for item in data_item.non_tensor_batch['retrievaled_images']]
-            reference_images_basename_list = [f'{extra_info["file_name"].split(".pdf")[0]}_{page}' for page in extra_info["reference_page"].tolist()]
+            try:
+                retrievaled_raw = data_item.non_tensor_batch.get('retrievaled_images', [])
+                if retrievaled_raw is None:
+                    retrievaled_raw = []
+                retrievaled_images_basename_list = [
+                    os.path.basename(str(item).rstrip('/')).split(".jpg")[0]
+                    for item in list(retrievaled_raw)
+                ]
+            except Exception:
+                retrievaled_images_basename_list = []
+            try:
+                reference_pages = extra_info.get("reference_page", [])
+                if reference_pages is None:
+                    reference_pages = []
+                reference_images_basename_list = [
+                    f'{extra_info["file_name"].split(".pdf")[0]}_{page}'
+                    for page in list(reference_pages)
+                ]
+            except Exception:
+                reference_images_basename_list = []
             
             if raw_score >0.0:    
                 ndcg_value = ndcg(retrievaled_images_basename_list, reference_images_basename_list)
@@ -251,6 +277,41 @@ class RMManager:
 
             reward_tensor[i, valid_response_length - 1] = final_score
 
+            format_scores.append(float(raw_score) if raw_score is not None else 0.0)
+            ndcg_scores.append(float(ndcg_value))
+            final_scores.append(float(final_score))
+
+            # Unified log: per-sample RM detail (best-effort)
+            if _UNIFIED_LOGGER.enabled:
+                try:
+                    uid_val = None
+                    try:
+                        uid_val = data_item.non_tensor_batch.get('uid', None)
+                    except Exception:
+                        uid_val = None
+                    if uid_val is None:
+                        try:
+                            uid_val = data_item.non_tensor_batch.get('id', None)
+                        except Exception:
+                            uid_val = None
+                    _UNIFIED_LOGGER.log_event({
+                        "event_type": "rm.phase1.detail",
+                        "uid": str(uid_val) if uid_val is not None else None,
+                        "sample_idx": int(i),
+                        "data_source": str(data_source),
+                        "prompt": prompt_str,
+                        "response": response_str,
+                        "ground_truth": ground_truth,
+                        "format_score": float(raw_score) if raw_score is not None else 0.0,
+                        "format_fail_reason": fail_reason,
+                        "ndcg": float(ndcg_value),
+                        "final_score": float(final_score),
+                        "retrieved_basenames": list(retrievaled_images_basename_list),
+                        "reference_basenames": list(reference_images_basename_list),
+                    })
+                except Exception:
+                    pass
+
 
             #old logging
             # # structured logging
@@ -279,49 +340,48 @@ class RMManager:
             #     }
             # )    
             ####수정 추가 완료: log 작성###        
-            retrieved_image_files = [os.path.basename(p) for p in data_item.non_tensor_batch.get('retrievaled_images', [])]
-            
-            # 2. 로그에 기록할 response 문자열을 새로 만듭니다.
-            response_str_for_log = response_str
-            if retrieved_image_files:
-                # 이미지 경로로 채워진 보기 좋은 플레이스홀더를 만듭니다.
-                image_placeholder = f" [Image Paths: {', '.join(retrieved_image_files)}] "
-                # 정규표현식을 사용해 <|vision_start|>와 <|vision_end|> 사이의 모든 내용을 플레이스홀더로 교체합니다.
-                response_str_for_log = re.sub(
-                    r"(<\|vision_start\|>).*?(<\|vision_end\|>)",
-                    r"\1" + image_placeholder + r"\2",
-                    response_str,
-                    flags=re.DOTALL
+            if not _UNIFIED_LOGGER.enabled:
+                retrieved_raw = data_item.non_tensor_batch.get('retrievaled_images', [])
+                if retrieved_raw is None:
+                    retrieved_raw = []
+                retrieved_image_files = [os.path.basename(str(p)) for p in list(retrieved_raw)]
+
+                # 2. 로그에 기록할 response 문자열을 새로 만듭니다.
+                response_str_for_log = response_str
+                if retrieved_image_files:
+                    # 이미지 경로로 채워진 보기 좋은 플레이스홀더를 만듭니다.
+                    image_placeholder = f" [Image Paths: {', '.join(retrieved_image_files)}] "
+                    # 정규표현식을 사용해 <|vision_start|>와 <|vision_end|> 사이의 모든 내용을 플레이스홀더로 교체합니다.
+                    response_str_for_log = re.sub(
+                        r"(<\|vision_start\|>).*?(<\|vision_end\|>)",
+                        r"\1" + image_placeholder + r"\2",
+                        response_str,
+                        flags=re.DOTALL
+                    )
+
+                # structured logging
+                uid = str(data_item.non_tensor_batch['uid'])
+                query_key = uid
+                if query_key not in log_data_for_step:
+                    log_data_for_step[query_key] = {"prompt": prompt_str, "agents": []}
+
+                agent_id = len(log_data_for_step[query_key]["agents"]) + 1
+                log_data_for_step[query_key]["agents"].append(
+                    {
+                        "agent_id": agent_id,
+                        "response": response_str_for_log,
+                        "scores": {
+                            "raw_score": raw_score,
+                            "fail_reason": fail_reason,
+                            "ndcg_value": ndcg_value,
+                            "⭐️final_score⭐️": final_score,
+                            "ndcg_details": {
+                                "retrieved_documents": retrievaled_images_basename_list,
+                                "reference_documents": reference_images_basename_list,
+                            }
+                        },
+                    }
                 )
-
-            # structured logging
-            uid = str(data_item.non_tensor_batch['uid'])
-            query_key = uid
-            #if query_key not in log_data:
-            if query_key not in log_data_for_step:
-                #log_data[query_key] = {"prompt": prompt_str, "agents": []}
-                log_data_for_step[query_key] = {"prompt": prompt_str, "agents": []}
-
-            #agent_id = len(log_data[query_key]["agents"]) + 1
-            agent_id = len(log_data_for_step[query_key]["agents"]) + 1
-            #log_data[query_key]["agents"].append(
-            log_data_for_step[query_key]["agents"].append(
-                {
-                    "agent_id": agent_id,
-                    "response": response_str_for_log,  
-                    "scores": {
-                        "raw_score": raw_score,    
-                        "fail_reason": fail_reason,           
-                        "ndcg_value": ndcg_value,
-                        "⭐️final_score⭐️": final_score,
-                        "ndcg_details": {
-                            "retrieved_documents": retrievaled_images_basename_list,
-                            "reference_documents": reference_images_basename_list,
-                        }
-
-                    },
-                }
-            )            
 
             if data_source not in already_print_data_sources:
                 already_print_data_sources[data_source] = 0
@@ -334,11 +394,30 @@ class RMManager:
                 #print("[score]", score) 수정 제거: log 작성
                 print("[score]", final_score) #수정 추가 : log 작성
 
-        ###수정 추가:log 작성#
-        os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
-        with open(self.log_path, "w") as f:
-            json.dump(log_data, f, ensure_ascii=False, indent=2)            
-        ###수정 추가 끝: log 작성#
+        # (legacy) log file write: unified 로깅 사용 시 중복/병목이므로 비활성화
+        if not _UNIFIED_LOGGER.enabled:
+            os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+            with open(self.log_path, "w") as f:
+                json.dump(log_data, f, ensure_ascii=False, indent=2)
 
+        def safe_mean(xs):
+            return float(sum(xs) / len(xs)) if xs else 0.0
 
-        return reward_tensor
+        metrics = {
+            "reward/ndcg_mean": safe_mean(ndcg_scores),
+            "reward/format_score_mean": safe_mean(format_scores),
+            "reward/final_score_mean": safe_mean(final_scores),
+            "reward/format_pass_rate": float(sum(1 for s in format_scores if s > 0.0) / len(format_scores)) if format_scores else 0.0,
+        }
+
+        if _UNIFIED_LOGGER.enabled:
+            try:
+                _UNIFIED_LOGGER.log_event({
+                    "event_type": "rm.phase1.batch.metrics",
+                    "batch_size": int(len(data)),
+                    **metrics,
+                })
+            except Exception:
+                pass
+
+        return reward_tensor, metrics
