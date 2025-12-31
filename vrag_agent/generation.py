@@ -31,6 +31,10 @@ from lsm_tmp.gpu_monitor import GPUMonitor
 from datetime import datetime
 # ▲▲▲[성능 측정 추가]▲▲▲
 
+from verl.utils.unified_logger import get_unified_logger
+
+_UNIFIED_LOGGER = get_unified_logger()
+
 # =============================================================================
 # [Phase 2] 텐서 연산 최적화용 로깅 유틸리티
 # =============================================================================
@@ -84,6 +88,17 @@ def _log_frozen_generator_detail(
         'error': error
     }
 
+    # Unified log (single-file)
+    _UNIFIED_LOGGER.log(
+        "frozen.response",
+        sample_idx=int(idx),
+        question=question,
+        image_paths=list(image_paths) if image_paths is not None else [],
+        answer=answer,
+        status_code=int(status_code) if status_code is not None else None,
+        error=error,
+    )
+
     # 콘솔 출력 (간략 버전)
     status = "SUCCESS" if status_code == 200 and not error else f"ERROR: {error or f'code={status_code}'}"
     print(f"\n{'='*60}")
@@ -93,12 +108,13 @@ def _log_frozen_generator_detail(
     print(f"  Answer: {answer[:200]}{'...' if len(answer) > 200 else ''}")
     print(f"{'='*60}\n")
 
-    # JSONL 파일에 저장
-    try:
-        with open(_FROZEN_GEN_LOG_PATH, 'a', encoding='utf-8') as f:
-            f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
-    except Exception as e:
-        print(f"[Frozen Generator] 상세 로그 저장 실패: {e}")
+    # (legacy) JSONL 파일에 저장: unified 로깅 사용 시 중복되므로 기본 비활성화
+    if not _UNIFIED_LOGGER.enabled:
+        try:
+            with open(_FROZEN_GEN_LOG_PATH, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+        except Exception as e:
+            print(f"[Frozen Generator] 상세 로그 저장 실패: {e}")
 
 
 # =============================================================================
@@ -215,6 +231,15 @@ def _log_search_detail(entry: Dict[str, Any]) -> None:
     except Exception:
         line = json.dumps({"error": "json_dumps_failed", "pid": os.getpid()}, ensure_ascii=False)
 
+    # Unified log (single-file)
+    try:
+        _UNIFIED_LOGGER.log_event({**entry, "event_type": "tool.search.detail"})
+    except Exception:
+        pass
+
+    # (legacy) JSONL 파일에 저장: unified 로깅 사용 시 중복되므로 기본 비활성화
+    if _UNIFIED_LOGGER.enabled:
+        return
     try:
         with _SEARCH_DEBUG_LOCK:
             if _SEARCH_DEBUG_MAX_LINES is not None and _SEARCH_DEBUG_LINES >= _SEARCH_DEBUG_MAX_LINES:
@@ -453,12 +478,6 @@ async def _call_frozen_generator_async_single_impl(
             "You are a visual QA generator. "
             "Use only the provided images and the user question. "
             "Return ONLY the final answer text without extra explanations. "
-            "If you need to crop an image, output exactly one line in the form <bbox>[x1, y1, x2, y2]</bbox>. "
-            "BBox rules: pixel coordinates with origin at the top-left (0,0), x increases to the right, y increases downward. "
-            "Must satisfy 0 <= x1 < x2 <= image_width and 0 <= y1 < y2 <= image_height; positive area required. "
-            "Good example: <bbox>[10, 20, 200, 180]</bbox>. "
-            "Bad example (rejected because x1 >= x2): <bbox>[200, 20, 10, 180]</bbox>. "
-            "If the bbox is invalid it will be rejected."
         )
 
         # Responses API 형식으로 입력 구성
@@ -484,11 +503,15 @@ async def _call_frozen_generator_async_single_impl(
             {"role": "user", "content": user_content},
         ]
 
-        # 비동기 API 호출 (Reasoning minimal)
+        # 환경 변수에서 reasoning effort 로드 (기본값: minimal)
+        # options: minimal, low, medium, high (depending on model support)
+        reasoning_effort = os.getenv("FROZEN_REASONING_EFFORT", "minimal")
+
+        # 비동기 API 호출
         response = await client.responses.create(
             model=model,
             input=inputs,
-            reasoning={"effort": "minimal"},
+            reasoning={"effort": reasoning_effort},
             max_output_tokens=max_tokens,
         )
 
@@ -959,9 +982,14 @@ class LLMGenerationManager:
                     last_img_path = self.retrievaled_images[idx][-1]
                     
                     # Future 제출
+                    uid_val = None
+                    try:
+                        uid_val = rollings.non_tensor_batch.get("id", [None])[idx]
+                    except Exception:
+                        uid_val = None
                     future = self._tool_executor.submit(
                         self._process_bbox_single,
-                        idx, obs_item, latest_image.size, last_img_path, self.is_validation
+                        idx, obs_item, latest_image.size, last_img_path, self.is_validation, uid_val
                     )
                     bbox_futures[future] = idx
                 except Exception as e:
@@ -1124,7 +1152,7 @@ class LLMGenerationManager:
 
         return next_obs_ids, next_obs_str, multi_modal_data, multi_modal_inputs
 
-    def _process_bbox_single(self, idx, obs_item, size, last_img_path, is_validation):
+    def _process_bbox_single(self, idx, obs_item, size, last_img_path, is_validation, uid=None):
         """Worker function for BBox processing"""
         start_time = _time.perf_counter()
         # _phase2_logger.debug(f"[Tool:BBox] Idx {idx}: Start processing. Coords={obs_item}, Image={last_img_path}")
@@ -1190,6 +1218,21 @@ class LLMGenerationManager:
 
         duration = _time.perf_counter() - start_time
         # _phase2_logger.debug(f"[Tool:BBox] Idx {idx}: Completed in {duration:.4f}s")
+
+        # Unified log (single-file)
+        try:
+            _UNIFIED_LOGGER.log(
+                "tool.bbox.result",
+                uid=str(uid) if uid is not None else None,
+                sample_idx=int(idx),
+                bbox=list(obs_item) if isinstance(obs_item, (list, tuple)) else obs_item,
+                last_img_path=str(last_img_path),
+                crop_path=str(crop_path),
+                is_validation=bool(is_validation),
+                latency_s=float(duration),
+            )
+        except Exception:
+            pass
 
         return {
             'raw_images_list': raw_images_list,
@@ -1721,6 +1764,27 @@ class LLMGenerationManager:
             responses_ids = responses_ids.to(rollings.batch['input_ids'].device)
             #//
 
+            # Unified log: actor plan output (raw text, per-turn, per-sample)
+            try:
+                all_uids_for_log = rollings.non_tensor_batch.get("id", None)
+                for i, s in enumerate(responses_str):
+                    uid_val = None
+                    if all_uids_for_log is not None:
+                        try:
+                            uid_val = all_uids_for_log[i]
+                        except Exception:
+                            uid_val = None
+                    _UNIFIED_LOGGER.log(
+                        "model.plan",
+                        uid=str(uid_val) if uid_val is not None else None,
+                        sample_idx=int(i),
+                        turn_idx=int(step),
+                        is_last_turn=bool(is_last_turn),
+                        text=str(s),
+                    )
+            except Exception:
+                pass
+
 
             #수정----#
             # 1. execute_predictions를 호출하기 전에 uids를 가져옵니다
@@ -1796,6 +1860,27 @@ class LLMGenerationManager:
                 meta_info = gen_output.meta_info
                 responses_ids, responses_str = self._postprocess_responses(gen_output.batch['responses'])
                 responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
+
+                # Unified log: actor plan output (raw text, final rollout, per-sample)
+                try:
+                    all_uids_for_log = rollings.non_tensor_batch.get("id", None)
+                    for i, s in enumerate(responses_str):
+                        uid_val = None
+                        if all_uids_for_log is not None:
+                            try:
+                                uid_val = all_uids_for_log[i]
+                            except Exception:
+                                uid_val = None
+                        _UNIFIED_LOGGER.log(
+                            "model.plan",
+                            uid=str(uid_val) if uid_val is not None else None,
+                            sample_idx=int(i),
+                            turn_idx=int(self.config.max_turns - 1),
+                            final_rollout=True,
+                            text=str(s),
+                        )
+                except Exception:
+                    pass
 
                 all_uids = rollings.non_tensor_batch['id'] #수정 uid 추가 
 
@@ -2088,6 +2173,17 @@ class LLMGenerationManager:
                 search_indices.append(i)
                 self._latest_search_queries[i] = content
                 self._latest_search_ids[i] = search_id
+                # Unified log: tool search request (per-sample)
+                try:
+                    _UNIFIED_LOGGER.log(
+                        "tool.search.request",
+                        uid=str(uids[i]),
+                        sample_idx=int(i),
+                        query=str(content),
+                        search_id=int(search_id),
+                    )
+                except Exception:
+                    pass
 
         # 2. Search Task 시작 (Non-blocking)
         search_task = None
@@ -2147,12 +2243,32 @@ class LLMGenerationManager:
                 for i in search_indices:
                     if active_mask[i]:
                         next_obs[i] = results_map.get(i, [])
+                        # Unified log: tool search response (full results list)
+                        try:
+                            _UNIFIED_LOGGER.log(
+                                "tool.search.response",
+                                uid=str(uids[i]),
+                                sample_idx=int(i),
+                                results=list(next_obs[i]) if next_obs[i] is not None else [],
+                            )
+                        except Exception:
+                            pass
             except Exception as e:
                 _phase2_logger.error(f"[AsyncPipeline] Search failed: {e}")
                 # 실패 시 빈 리스트로 처리
                 for i in search_indices:
                     if active_mask[i]:
                         next_obs[i] = []
+                        try:
+                            _UNIFIED_LOGGER.log(
+                                "tool.search.response",
+                                uid=str(uids[i]),
+                                sample_idx=int(i),
+                                results=[],
+                                error=str(e),
+                            )
+                        except Exception:
+                            pass
 
         # 5. 안전 장치 (None 제거)
         for i in range(n_samples):

@@ -20,6 +20,9 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time as _time 
 import random as _random 
+from verl.utils.unified_logger import get_unified_logger
+
+_UNIFIED_LOGGER = get_unified_logger()
 
 # ▼▼▼[성능 측정 추가]▼▼▼ 수정
 # GPUMonitor와 시간 기록을 위한 모듈을 가져옵니다.
@@ -236,116 +239,216 @@ class LLMGenerationManager:
 
     #     return next_obs_ids, next_obs_str, multi_modal_data, multi_modal_inputs
 
-    def _process_next_obs(self, next_obs: List, rollings) -> torch.Tensor:
-            """Process next observations from environment."""
-            next_obs_str = []
-            multi_modal_data = []
-            multi_modal_inputs = []
-            merge_length = self.processor.image_processor.merge_size**2
-            
-            for idx, obs_item in enumerate(next_obs):
-                # 1. Invalid String
-                if isinstance(obs_item,str):
-                    next_obs_str.append(obs_item)
+    def _process_next_obs(self, next_obs: List, rollings):
+        """Process next observations from environment."""
+        next_obs_str = []
+        multi_modal_data = []
+        multi_modal_inputs = []
+        merge_length = self.processor.image_processor.merge_size**2
+
+        for idx, obs_item in enumerate(next_obs):
+            # 1) Invalid string observation
+            if isinstance(obs_item, str):
+                next_obs_str.append(obs_item)
+                multi_modal_data.append({'image': []})
+                multi_modal_inputs.append(BatchFeature(dict()))
+                continue
+
+            # 2) Invalid action: bbox without any previous image
+            if (
+                isinstance(obs_item, list)
+                and obs_item
+                and not isinstance(obs_item[0], dict)
+                and len(self.retrievaled_images[idx]) == 0
+            ):
+                next_obs_str.append(
+                    '\n<|im_start|>user\nInvalid action: No image to crop. Please search first.\n<|im_end|>\n<|im_start|>assistant\n'
+                )
+                multi_modal_data.append({'image': []})
+                multi_modal_inputs.append(BatchFeature(dict()))
+                continue
+
+            # 3) BBox / crop observation
+            if isinstance(obs_item, list) and obs_item and not isinstance(obs_item[0], dict):
+                try:
+                    t0 = _time.perf_counter()
+                    latest_image = rollings.non_tensor_batch['multi_modal_data'][idx]['image'][-1]
+                    width, height = latest_image.size
+                    last_img_path = self.retrievaled_images[idx][-1]
+                    raw_images_crop = Image.open(last_img_path)
+                    raw_width, raw_height = raw_images_crop.size
+
+                    bbox = list(obs_item)
+                    if self.is_validation:
+                        bbox = [bbox[0] - 28, bbox[1] - 28, bbox[2] + 28, bbox[3] + 28]
+
+                    crop_area = [
+                        int(raw_width * bbox[0] / width),
+                        int(raw_height * bbox[1] / height),
+                        int(raw_width * bbox[2] / width),
+                        int(raw_height * bbox[3] / height),
+                    ]
+                    crop_area = [
+                        max(0, crop_area[0]),
+                        max(0, crop_area[1]),
+                        min(raw_width, crop_area[2]),
+                        min(raw_height, crop_area[3]),
+                    ]
+
+                    input_images_list = [raw_images_crop.crop((crop_area[0], crop_area[1], crop_area[2], crop_area[3]))]
+                    raw_images_list = [process_image(image, 512 * 28 * 28, 256 * 28 * 28) for image in input_images_list]
+
+                    crop_path = os.path.join(self.config.crops_dir, f"{uuid.uuid4().hex}.jpg")
+                    raw_images_list[0].save(crop_path)
+                    self.cropped_images[idx].append(crop_path)
+                    latency_s = _time.perf_counter() - t0
+
+                    if _UNIFIED_LOGGER.enabled:
+                        try:
+                            uid_val = rollings.non_tensor_batch.get("id", [None])[idx]
+                        except Exception:
+                            uid_val = None
+                        try:
+                            _UNIFIED_LOGGER.log(
+                                "tool.bbox.result",
+                                uid=str(uid_val) if uid_val is not None else None,
+                                sample_idx=int(idx),
+                                bbox=list(obs_item) if isinstance(obs_item, (list, tuple)) else obs_item,
+                                last_img_path=str(last_img_path),
+                                crop_path=str(crop_path),
+                                is_validation=bool(self.is_validation),
+                                latency_s=float(latency_s),
+                            )
+                        except Exception:
+                            pass
+
+                    image_inputs = self.processor.image_processor(raw_images_list, return_tensors='pt')
+                    if 'pixel_values' not in image_inputs:
+                        raise ValueError("BBox processing produced no pixel_values")
+
+                    multi_modal_data.append({'image': raw_images_list})
+                    multi_modal_inputs.append(image_inputs)
+                    image_grid_thw = image_inputs['image_grid_thw']
+                    obs_str = ''.join(
+                        [
+                            f"<|vision_start|>{self.processor.image_token * (image_grid_thw_item.prod() // merge_length)}<|vision_end|>"
+                            for image_grid_thw_item in image_grid_thw
+                        ]
+                    )
+                    obs_str = '\n<|im_start|>user\n' + obs_str + '<|im_end|>\n<|im_start|>assistant\n'
+                    next_obs_str.append(obs_str)
+
+                except Exception as e:
+                    print(f"[DEBUG] Bbox Error at idx {idx}: {e}")
+                    if _UNIFIED_LOGGER.enabled:
+                        try:
+                            uid_val = rollings.non_tensor_batch.get("id", [None])[idx]
+                        except Exception:
+                            uid_val = None
+                        last_img_path = None
+                        try:
+                            if self.retrievaled_images[idx]:
+                                last_img_path = self.retrievaled_images[idx][-1]
+                        except Exception:
+                            last_img_path = None
+                        try:
+                            _UNIFIED_LOGGER.log(
+                                "tool.bbox.result",
+                                uid=str(uid_val) if uid_val is not None else None,
+                                sample_idx=int(idx),
+                                bbox=list(obs_item) if isinstance(obs_item, (list, tuple)) else obs_item,
+                                last_img_path=str(last_img_path) if last_img_path is not None else None,
+                                crop_path=None,
+                                is_validation=bool(self.is_validation),
+                                latency_s=None,
+                                error=str(e),
+                            )
+                        except Exception:
+                            pass
+                    next_obs_str.append(
+                        '\n<|im_start|>user\n[System Error: Bbox Crop Failed] The image crop operation failed. Please try a different action.\n<|im_end|>\n<|im_start|>assistant\n'
+                    )
                     multi_modal_data.append({'image': []})
                     multi_modal_inputs.append(BatchFeature(dict()))
-                
-                # 2. Invalid Action (No previous image)
-                elif isinstance(obs_item, list) and not isinstance(obs_item[0],dict) and len(self.retrievaled_images[idx]) == 0:
-                    next_obs_str.append('\n<|im_start|>user\nInvalid action: No image to crop. Please search first.\n<|im_end|>\n<|im_start|>assistant\n')
-                    multi_modal_data.append({'image': []})
-                    multi_modal_inputs.append(BatchFeature(dict()))
-                
-                # 3. [BBOX / CROP] 구간
-                elif isinstance(obs_item,list) and not isinstance(obs_item[0],dict):
+                continue
+
+            # 4) Search / retrieval observation
+            if isinstance(obs_item, list) and obs_item and isinstance(obs_item[0], dict):
+                img_file_list = [item.get('image_file') for item in obs_item if isinstance(item, dict) and 'image_file' in item]
+                input_images_list = []
+                for image_item in img_file_list:
+                    if image_item not in self.retrievaled_images[idx]:
+                        self.retrievaled_images[idx].append(image_item)
+                        input_images_list = [image_item]
+                        break
+
+                if _UNIFIED_LOGGER.enabled:
                     try:
-                        # 기존 로직 수행
-                        latest_image = rollings.non_tensor_batch['multi_modal_data'][idx]['image'][-1]
-                        width, height = latest_image.size
-                        raw_images_crop = Image.open(self.retrievaled_images[idx][-1])
-                        raw_width, raw_height = raw_images_crop.size
-                        
-                        if self.is_validation:
-                            obs_item = [obs_item[0]-28, obs_item[1]-28, obs_item[2]+28, obs_item[3]+28]
-                        crop_area = [int(raw_width * obs_item[0] / width), int(raw_height * obs_item[1] / height), int(raw_width * obs_item[2] / width), int(raw_height * obs_item[3] / height)]
-                        crop_area = [max(0, crop_area[0]), max(0, crop_area[1]), min(raw_width, crop_area[2]), min(raw_height, crop_area[3])]
-                        input_images_list = [raw_images_crop.crop((crop_area[0], crop_area[1], crop_area[2], crop_area[3]))]
-                        raw_images_list = [process_image(image, 512*28*28, 256*28*28) for image in input_images_list]
-
-                        # generator added
-                        crop_path = os.path.join(self.config.crops_dir, f"{uuid.uuid4().hex}.jpg")
-                        raw_images_list[0].save(crop_path)
-                        self.cropped_images[idx].append(crop_path)
-
-                        image_inputs = self.processor.image_processor(raw_images_list, return_tensors='pt') 
-                        
-                        # [검증] pixel_values 확인
-                        if 'pixel_values' in image_inputs:
-                            multi_modal_data.append({'image': raw_images_list})
-                            multi_modal_inputs.append(image_inputs)
-                            image_grid_thw = image_inputs['image_grid_thw']
-                            obs_str = ''.join([f"<|vision_start|>{self.processor.image_token * (image_grid_thw_item.prod() // merge_length)}<|vision_end|>" for image_grid_thw_item in image_grid_thw])
-                            raw_obs_str = f"<|vision_start|>{self.processor.image_token}<|vision_end|>" * len(image_grid_thw) 
-                            obs_str = '\n<|im_start|>user\n' + obs_str + '<|im_end|>\n<|im_start|>assistant\n'
-                            next_obs_str.append(obs_str)
-                        else:
-                            raise ValueError("BBox processing produced no pixel_values")
-
-                    except Exception as e:
-                        # [BBOX 실패 시 명확한 에러 메시지]
-                        print(f"[DEBUG] Bbox Error at idx {idx}: {e}")
-                        next_obs_str.append('\n<|im_start|>user\n[System Error: Bbox Crop Failed] The image crop operation failed. Please try a different action.\n<|im_end|>\n<|im_start|>assistant\n')
-                        multi_modal_data.append({'image': []})
-                        multi_modal_inputs.append(BatchFeature(dict())) 
-
-                # 4. [SEARCH / RETRIEVAL] 구간
-                elif isinstance(obs_item,list) and isinstance(obs_item[0],dict):
-
-                    img_file_list = [item['image_file'] for item in obs_item]
-                    for image_item in img_file_list:
-                        if image_item not in self.retrievaled_images[idx]:
-                            self.retrievaled_images[idx].append(image_item)
-                            input_images_list = [image_item]
-                            break
-                    
+                        uid_val = rollings.non_tensor_batch.get("id", [None])[idx]
+                    except Exception:
+                        uid_val = None
+                    chosen_image = input_images_list[0] if input_images_list else None
+                    chosen_rank = None
+                    if chosen_image is not None:
+                        try:
+                            chosen_rank = img_file_list.index(chosen_image)
+                        except Exception:
+                            chosen_rank = None
                     try:
-                        raw_images_list = [process_image(image, 512*28*28, 256*28*28) for image in input_images_list]
-                        image_inputs = self.processor.image_processor(raw_images_list, return_tensors='pt')
+                        _UNIFIED_LOGGER.log_event({
+                            "event_type": "tool.search.select_image",
+                            "uid": str(uid_val) if uid_val is not None else None,
+                            "sample_idx": int(idx),
+                            "results_n": int(len(img_file_list)),
+                            "results_image_files": list(img_file_list),
+                            "chosen_image_file": chosen_image,
+                            "chosen_rank": chosen_rank,
+                        })
+                    except Exception:
+                        pass
 
-                        if 'pixel_values' in image_inputs:
-                            multi_modal_data.append({'image': raw_images_list})
-                            multi_modal_inputs.append(image_inputs)
-                            
-                            image_grid_thw = image_inputs['image_grid_thw']
-                            obs_str = ''.join([f"<|vision_start|>{self.processor.image_token * (image_grid_thw_item.prod() // merge_length)}<|vision_end|>" for image_grid_thw_item in image_grid_thw])
-                            obs_str = '\n<|im_start|>user\n' + obs_str + '<|im_end|>\n<|im_start|>assistant\n'
-                            next_obs_str.append(obs_str)
-                        else:
-                            # [SEARCH 실패 시 명확한 에러 메시지]
-                            print(f"[DEBUG] Search Image Error at idx {idx}: No pixel_values")
-                            error_msg = "\n<|im_start|>user\n[System Error: Search Image Failed] The retrieved image is corrupted or invalid.\n<|im_end|>\n<|im_start|>assistant\n"
-                            next_obs_str.append(error_msg)
-                            multi_modal_data.append({'image': []})
-                            multi_modal_inputs.append(BatchFeature(dict()))
+                try:
+                    raw_images_list = [process_image(image, 512 * 28 * 28, 256 * 28 * 28) for image in input_images_list]
+                    image_inputs = self.processor.image_processor(raw_images_list, return_tensors='pt')
 
-                    except Exception as e:
-                        print(f"[DEBUG] Search Processing Exception at idx {idx}: {e}")
-                        error_msg = "\n<|im_start|>user\n[System Error: Search Image Processing Exception]\n<|im_end|>\n<|im_start|>assistant\n"
-                        next_obs_str.append(error_msg)
+                    if 'pixel_values' in image_inputs:
+                        multi_modal_data.append({'image': raw_images_list})
+                        multi_modal_inputs.append(image_inputs)
+                        image_grid_thw = image_inputs['image_grid_thw']
+                        obs_str = ''.join(
+                            [
+                                f"<|vision_start|>{self.processor.image_token * (image_grid_thw_item.prod() // merge_length)}<|vision_end|>"
+                                for image_grid_thw_item in image_grid_thw
+                            ]
+                        )
+                        obs_str = '\n<|im_start|>user\n' + obs_str + '<|im_end|>\n<|im_start|>assistant\n'
+                        next_obs_str.append(obs_str)
+                    else:
+                        print(f"[DEBUG] Search Image Error at idx {idx}: No pixel_values")
+                        next_obs_str.append(
+                            "\n<|im_start|>user\n[System Error: Search Image Failed] The retrieved image is corrupted or invalid.\n<|im_end|>\n<|im_start|>assistant\n"
+                        )
                         multi_modal_data.append({'image': []})
                         multi_modal_inputs.append(BatchFeature(dict()))
+                except Exception as e:
+                    print(f"[DEBUG] Search Processing Exception at idx {idx}: {e}")
+                    next_obs_str.append(
+                        "\n<|im_start|>user\n[System Error: Search Image Processing Exception]\n<|im_end|>\n<|im_start|>assistant\n"
+                    )
+                    multi_modal_data.append({'image': []})
+                    multi_modal_inputs.append(BatchFeature(dict()))
+                continue
 
-                else:
-                    raise ValueError('invalid observation')
-            
-            next_obs_ids = self.tokenizer(
-                next_obs_str, 
-                padding='longest',
-                return_tensors='pt',
-                add_special_tokens=False,
-            )['input_ids']
+            raise ValueError('invalid observation')
 
-            return next_obs_ids, next_obs_str, multi_modal_data, multi_modal_inputs
+        next_obs_ids = self.tokenizer(
+            next_obs_str,
+            padding='longest',
+            return_tensors='pt',
+            add_special_tokens=False,
+        )['input_ids']
+
+        return next_obs_ids, next_obs_str, multi_modal_data, multi_modal_inputs
 #//
 
     
@@ -590,7 +693,8 @@ class LLMGenerationManager:
         # ▼▼▼[성능 측정 추가] 1. 로그 파일 및 모니터 객체 초기화▼▼▼ 수정
         # 고유한 로그 파일 이름을 생성하여 모든 측정 결과를 한 파일에 기록합니다.
         current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_filename = f"./logs/generation_detail_{current_time}_{uuid.uuid4().hex[:6]}.txt"
+        # (legacy) file logging: unified 로깅 사용 시 파편화/중복이므로 비활성화
+        log_filename = None if _UNIFIED_LOGGER.enabled else f"./logs/generation_detail_{current_time}_{uuid.uuid4().hex[:6]}.txt"
         
         # 측정 지점 1: 메인 모델(Actor)의 '계획' 생성 성능 측정용
         actor_monitor = GPUMonitor(log_file=log_filename, label="[1] Actor Generation (Planning)")
@@ -670,6 +774,28 @@ class LLMGenerationManager:
             responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
             responses_ids = responses_ids.to(rollings.batch['input_ids'].device)
 
+            # Unified log: actor plan output (raw text, per-turn, per-sample)
+            if _UNIFIED_LOGGER.enabled:
+                try:
+                    all_uids_for_log = rollings.non_tensor_batch.get("id", None)
+                    for j, s in enumerate(responses_str):
+                        uid_val = None
+                        if all_uids_for_log is not None:
+                            try:
+                                uid_val = all_uids_for_log[j]
+                            except Exception:
+                                uid_val = None
+                        _UNIFIED_LOGGER.log(
+                            "model.plan",
+                            uid=str(uid_val) if uid_val is not None else None,
+                            sample_idx=int(j),
+                            turn_idx=int(step),
+                            is_last_turn=bool(is_last_turn),
+                            text=str(s),
+                        )
+                except Exception:
+                    pass
+
 
             #수정----#
             # 1. execute_predictions를 호출하기 전에 uids를 가져옵니다
@@ -743,6 +869,28 @@ class LLMGenerationManager:
                 meta_info = gen_output.meta_info
                 responses_ids, responses_str = self._postprocess_responses(gen_output.batch['responses'])
                 responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
+
+                # Unified log: final rollout plan output (best-effort)
+                if _UNIFIED_LOGGER.enabled:
+                    try:
+                        all_uids_for_log = rollings.non_tensor_batch.get("id", None)
+                        for j, s in enumerate(responses_str):
+                            uid_val = None
+                            if all_uids_for_log is not None:
+                                try:
+                                    uid_val = all_uids_for_log[j]
+                                except Exception:
+                                    uid_val = None
+                            _UNIFIED_LOGGER.log(
+                                "model.plan",
+                                uid=str(uid_val) if uid_val is not None else None,
+                                sample_idx=int(j),
+                                turn_idx=int(self.config.max_turns - 1),
+                                final_rollout=True,
+                                text=str(s),
+                            )
+                    except Exception:
+                        pass
 
                 all_uids = rollings.non_tensor_batch['id'] #수정 uid 추가 
 
@@ -848,6 +996,39 @@ class LLMGenerationManager:
         next_obs, dones = [], []
         
         bbox_list = [content for action, content in zip(cur_actions, contents) if action == 'bbox']
+
+        # Unified log: tool call requests (best-effort)
+        if _UNIFIED_LOGGER.enabled:
+            try:
+                for i, (action, content) in enumerate(zip(cur_actions, contents)):
+                    uid_val = None
+                    try:
+                        uid_val = uids[i]
+                    except Exception:
+                        uid_val = None
+                    if action == 'search':
+                        _UNIFIED_LOGGER.log_event({
+                            "event_type": "tool.search.request",
+                            "uid": str(uid_val) if uid_val is not None else None,
+                            "sample_idx": int(i),
+                            "query": content,
+                        })
+                    elif action == 'bbox':
+                        _UNIFIED_LOGGER.log_event({
+                            "event_type": "tool.bbox.request",
+                            "uid": str(uid_val) if uid_val is not None else None,
+                            "sample_idx": int(i),
+                            "bbox_raw": content,
+                        })
+                    elif action == 'search_complete':
+                        _UNIFIED_LOGGER.log_event({
+                            "event_type": "tool.search_complete",
+                            "uid": str(uid_val) if uid_val is not None else None,
+                            "sample_idx": int(i),
+                            "value": content,
+                        })
+            except Exception:
+                pass
         
         search_requests = []
         for i, (action, content) in enumerate(zip(cur_actions, contents)):
@@ -868,7 +1049,21 @@ class LLMGenerationManager:
                 for i in range(0, len(search_requests), batch_size):
                     batch_reqs = search_requests[i:i + batch_size]
 
-                    response = requests.post(self.config.search_url, json=batch_reqs)                    
+                    t0 = _time.perf_counter()
+                    response = requests.post(self.config.search_url, json=batch_reqs)
+                    latency_s = _time.perf_counter() - t0
+                    if _UNIFIED_LOGGER.enabled:
+                        try:
+                            _UNIFIED_LOGGER.log_event({
+                                "event_type": "tool.search.batch",
+                                "url": str(self.config.search_url),
+                                "batch_size": int(len(batch_reqs)),
+                                "status_code": int(getattr(response, "status_code", 0) or 0),
+                                "latency_s": float(latency_s),
+                                "request_indices": [int(r.get("request_idx", -1)) for r in batch_reqs],
+                            })
+                        except Exception:
+                            pass
                     search_results_single_batch = response.json()
                     search_results_list.extend(search_results_single_batch)                  
 
@@ -879,6 +1074,29 @@ class LLMGenerationManager:
         else:
             results_map = {}
          
+        # Unified log: tool call responses (best-effort)
+        if _UNIFIED_LOGGER.enabled and do_search and search_requests:
+            try:
+                for req in search_requests:
+                    req_idx = int(req.get("request_idx", -1))
+                    uid_val = None
+                    try:
+                        uid_val = uids[req_idx]
+                    except Exception:
+                        uid_val = None
+                    results = results_map.get(req_idx, [])
+                    _UNIFIED_LOGGER.log_event({
+                        "event_type": "tool.search.response",
+                        "uid": str(uid_val) if uid_val is not None else None,
+                        "sample_idx": int(req_idx),
+                        "query": req.get("query", None),
+                        "search_id": req.get("id", None),
+                        "results_n": int(len(results)) if results is not None else 0,
+                        "results": results,
+                    })
+            except Exception:
+                pass
+        
 
         for i, (action, active) in enumerate(zip(cur_actions, active_mask)):
             if not active:
@@ -962,7 +1180,3 @@ class LLMGenerationManager:
             contents.append(content)
             
         return actions, contents
-
-
-
-
