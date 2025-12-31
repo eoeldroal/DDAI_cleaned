@@ -33,24 +33,20 @@ export NDCG_DEBUG_PATH=./logs/ndcg_debug.jsonl
 export FLASH_RM_LOG=1
 export NDCG_DEBUG_LOG_ALL=1
 export SEARCH_DEBUG=1
-export SEARCH_DEBUG_LOG_ALL=1
-export SEARCH_DEBUG_MAX_LINES=1000000000
 
 # =============================================================================
-# Unified trajectory logging (single JSONL; append)
+# Reward Coefficients (Focused RL 설정)
 # =============================================================================
-export UNIFIED_LOG_ENABLE=1
-export UNIFIED_LOG_PATH=./logs/unified_trajectory.jsonl
-export UNIFIED_LOG_CLIENT_BATCH_SIZE=200
-export UNIFIED_LOG_CLIENT_FLUSH_INTERVAL_S=1.0
-export UNIFIED_LOG_WRITER_FLUSH_EVERY_N=2000
-export UNIFIED_LOG_WRITER_FLUSH_INTERVAL_S=2.0
+# Round 1: Judge Score 100%, NDCG 0% (정답 자체에 집중)
+export RM_JUDGE_COEF=1.0
+export RM_NDCG_COEF=0.0
 
 # =============================================================================
-# Reward Coefficients (Phase 2)
+# Frozen Generator Reasoning Effort
 # =============================================================================
-export RM_JUDGE_COEF=0.8
-export RM_NDCG_COEF=0.2
+# Options: minimal, low, medium, high (default: minimal)
+# Focused Round 1에서는 더 깊은 추론을 위해 "medium" 권장
+export FROZEN_REASONING_EFFORT="medium"
 
 export SEARCH_BATCH_SIZE=32
 export SEARCH_MAX_WORKERS=4
@@ -75,7 +71,7 @@ export WANDB_PROJECT='gspo_phase2_gemini'
 # vLLM 사용 시 PyTorch 내장 SDPA 사용 (flash_attn 패키지 불필요)
 # export VLLM_ATTENTION_BACKEND=TORCH_SDPA
 # HuggingFace transformers에서 flash_attn 사용 비활성화
-export ATTN_BACKEND=native
+# export ATTN_BACKEND=native
 
 export SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK=True
 
@@ -115,16 +111,10 @@ export DASHSCOPE_BASE_URL="${DASHSCOPE_BASE_URL:-https://dashscope-intl.aliyuncs
 # =============================================================================
 # 3. 모델 및 학습 설정
 # =============================================================================
-# 첫 번째 인자를 엔진으로 사용할 때만 소비(shift)합니다.
-# key=value 형태의 Hydra override가 첫 인자인 경우에는 엔진 기본값(sglang)을 유지합니다.
-ENGINE=sglang
-if [ $# -ge 1 ] && [[ "$1" != *=* ]]; then
-    ENGINE="$1"
-    shift
-fi
+ENGINE=${1:-sglang}
 
 # 모델 경로
-model_path=./RL_results/gspo_phase1
+model_path=./checkpoints/gspo_phase2_gemini_flash_curriculum/global_step_48/actor/huggingface
 
 # GPU 설정
 n_gpus=8
@@ -133,11 +123,11 @@ n_gpus=8
 # - train_batch_size: 원본 프롬프트 수
 # - n_agent: 프롬프트당 생성할 응답 수
 # - 실제 배치 크기 = train_batch_size × n_agent = 64 × 8 = 512
-train_batch_size=8
+train_batch_size=16
 ppo_mini_batch_size=8
 ppo_micro_batch_size_per_gpu=1
 log_prob_micro_batch_size_per_gpu=1
-n_agent=16
+n_agent=8
 
 # 기타 설정
 tensor_model_parallel_size=1
@@ -148,7 +138,7 @@ max_turns=7
 # 4. Gemini VLM Judge 설정
 # =============================================================================
 # 로그 경로 (JSONL 형식)
-log_path="./logs/gspo_gemini_output.jsonl"
+log_path="./logs/focused/gspo_gemini_output.jsonl"
 
 # 이미지 기본 경로 (검색된 이미지 및 정답 이미지)
 image_base_path="./data/images"
@@ -163,7 +153,7 @@ max_concurrent_requests=64
 # - True: Generation과 Reward를 파이프라인으로 병렬 처리 (약 13% 성능 향상)
 # - False: 기존 배치 모드 (모든 Generation 완료 후 Reward 계산)
 streaming_reward_enable=True
-streaming_reward_timeout=120
+streaming_reward_timeout=90
 
 # =============================================================================
 # 4-1. Frozen Generator 설정 (Qwen2.5-VL-72B-Instruct via DashScope)
@@ -177,13 +167,13 @@ frozen_max_concurrent=64
 frozen_model="gpt-5-mini-2025-08-07"
 
 # 최대 토큰 수 (답변 길이)
-frozen_max_tokens=2048
+frozen_max_tokens=3072
 
 # 재시도 설정
-frozen_max_retries=10
-frozen_backoff_base=1.5
-frozen_total_timeout=120
-frozen_async_wrapper_timeout=120
+frozen_max_retries=8
+frozen_backoff_base=2
+frozen_total_timeout=600
+frozen_async_wrapper_timeout=600
 
 # =============================================================================
 # 5. Retriever 설정
@@ -193,7 +183,7 @@ search_url="http://163.239.28.21:5002/search"
 # =============================================================================
 # 6. 로그 디렉토리 생성
 # =============================================================================
-mkdir -p ./logs
+mkdir -p ./logs/focused
 echo ">>> 로그 경로: $log_path"
 
 # =============================================================================
@@ -213,6 +203,8 @@ echo "Gemini 모델: $gemini_model"
 echo "동시 요청 수: $max_concurrent_requests"
 echo "스트리밍 Reward: $streaming_reward_enable"
 echo "스트리밍 Reward timeout(s): $streaming_reward_timeout"
+echo "Reward Coefs: Judge=$RM_JUDGE_COEF, NDCG=$RM_NDCG_COEF"
+echo "Frozen Reasoning Effort: $FROZEN_REASONING_EFFORT"
 echo "----------------------------------------"
 echo "[Phase 5] Frozen Generator (OpenAI Async)"
 echo "  모델: $frozen_model"
@@ -224,7 +216,7 @@ echo "=========================================="
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    data.train_files=./data/curriculum_bucket_a.parquet \
+    data.train_files=./data/focused_round1.parquet \
     data.val_files=./data/rag/overall_test_crop.parquet \
     data.train_batch_size=$train_batch_size \
     data.max_prompt_length=256 \
@@ -280,7 +272,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger=['wandb','console'] \
     trainer.project_name=gspo_phase2_gemini \
-    trainer.experiment_name=gspo_phase2_gemini_flash_curriculum \
+    trainer.experiment_name=gspo_phase2_gemini_flash_curriculum_focused_round_1 \
     trainer.n_gpus_per_node=$n_gpus \
     trainer.nnodes=1 \
     trainer.save_freq=30 \
@@ -288,7 +280,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.total_epochs=1 \
     trainer.resume_mode=auto \
     retriever.url=$search_url \
-    max_turns=$max_turns "$@"
+    max_turns=$max_turns $@
 # =============================================================================
 # 9. 완료
 # =============================================================================

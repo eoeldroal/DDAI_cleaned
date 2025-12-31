@@ -26,6 +26,8 @@ echo ">>> OpenAI API Key 확인 완료"
 export PYTHONNOUSERSITE=1
 export PYTHONASYNCIODEBUG=1  
 
+# export PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync,max_split_size_mb:256 -> RuntimeError: cudaMallocAsync does not yet support shareIpcHandle. If you need it, please file an issue describing your use case.
+
 export GEMINI_DEBUG_VERBOSE=2
 export FROZEN_DEBUG_VERBOSE=2
 export NDCG_DEBUG=1  # <--- 추가됨
@@ -33,24 +35,31 @@ export NDCG_DEBUG_PATH=./logs/ndcg_debug.jsonl
 export FLASH_RM_LOG=1
 export NDCG_DEBUG_LOG_ALL=1
 export SEARCH_DEBUG=1
-export SEARCH_DEBUG_LOG_ALL=1
-export SEARCH_DEBUG_MAX_LINES=1000000000
+export VERL_PPO_LOGGING_LEVEL=DEBUG
 
 # =============================================================================
-# Unified trajectory logging (single JSONL; append)
+# Unified trajectory logging (single JSONL)
 # =============================================================================
 export UNIFIED_LOG_ENABLE=1
-export UNIFIED_LOG_PATH=./logs/unified_trajectory.jsonl
+export UNIFIED_LOG_PATH=./logs/focused2/unified_trajectory.jsonl
 export UNIFIED_LOG_CLIENT_BATCH_SIZE=200
 export UNIFIED_LOG_CLIENT_FLUSH_INTERVAL_S=1.0
 export UNIFIED_LOG_WRITER_FLUSH_EVERY_N=2000
 export UNIFIED_LOG_WRITER_FLUSH_INTERVAL_S=2.0
 
 # =============================================================================
-# Reward Coefficients (Phase 2)
+# Reward Coefficients (Focused RL 설정)
 # =============================================================================
-export RM_JUDGE_COEF=0.8
-export RM_NDCG_COEF=0.2
+# Round 1: Judge Score 100%, NDCG 0% (정답 자체에 집중)
+export RM_JUDGE_COEF=1.0
+export RM_NDCG_COEF=0.0
+
+# =============================================================================
+# Frozen Generator Reasoning Effort
+# =============================================================================
+# Options: minimal, low, medium, high (default: minimal)
+# Focused Round 1에서는 더 깊은 추론을 위해 "medium" 권장
+export FROZEN_REASONING_EFFORT="medium"
 
 export SEARCH_BATCH_SIZE=32
 export SEARCH_MAX_WORKERS=4
@@ -75,7 +84,7 @@ export WANDB_PROJECT='gspo_phase2_gemini'
 # vLLM 사용 시 PyTorch 내장 SDPA 사용 (flash_attn 패키지 불필요)
 # export VLLM_ATTENTION_BACKEND=TORCH_SDPA
 # HuggingFace transformers에서 flash_attn 사용 비활성화
-export ATTN_BACKEND=native
+# export ATTN_BACKEND=native
 
 export SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK=True
 
@@ -124,7 +133,7 @@ if [ $# -ge 1 ] && [[ "$1" != *=* ]]; then
 fi
 
 # 모델 경로
-model_path=./RL_results/gspo_phase1
+model_path=./checkpoints/gspo_phase2_gemini_flash_curriculum_focused_round_1/merged_model
 
 # GPU 설정
 n_gpus=8
@@ -132,7 +141,7 @@ n_gpus=8
 # 배치 크기 설정
 # - train_batch_size: 원본 프롬프트 수
 # - n_agent: 프롬프트당 생성할 응답 수
-# - 실제 배치 크기 = train_batch_size × n_agent = 64 × 8 = 512
+# - 실제 배치 크기 = train_batch_size × n_agent
 train_batch_size=8
 ppo_mini_batch_size=8
 ppo_micro_batch_size_per_gpu=1
@@ -142,13 +151,13 @@ n_agent=16
 # 기타 설정
 tensor_model_parallel_size=1
 val_before_train=False
-max_turns=7
+max_turns=15
 
 # =============================================================================
 # 4. Gemini VLM Judge 설정
 # =============================================================================
 # 로그 경로 (JSONL 형식)
-log_path="./logs/gspo_gemini_output.jsonl"
+log_path="./logs/focused2/gspo_gemini_output.jsonl"
 
 # 이미지 기본 경로 (검색된 이미지 및 정답 이미지)
 image_base_path="./data/images"
@@ -163,7 +172,7 @@ max_concurrent_requests=64
 # - True: Generation과 Reward를 파이프라인으로 병렬 처리 (약 13% 성능 향상)
 # - False: 기존 배치 모드 (모든 Generation 완료 후 Reward 계산)
 streaming_reward_enable=True
-streaming_reward_timeout=120
+streaming_reward_timeout=90
 
 # =============================================================================
 # 4-1. Frozen Generator 설정 (Qwen2.5-VL-72B-Instruct via DashScope)
@@ -177,13 +186,13 @@ frozen_max_concurrent=64
 frozen_model="gpt-5-mini-2025-08-07"
 
 # 최대 토큰 수 (답변 길이)
-frozen_max_tokens=2048
+frozen_max_tokens=3072
 
 # 재시도 설정
-frozen_max_retries=10
-frozen_backoff_base=1.5
-frozen_total_timeout=120
-frozen_async_wrapper_timeout=120
+frozen_max_retries=8
+frozen_backoff_base=2
+frozen_total_timeout=600
+frozen_async_wrapper_timeout=600
 
 # =============================================================================
 # 5. Retriever 설정
@@ -193,7 +202,7 @@ search_url="http://163.239.28.21:5002/search"
 # =============================================================================
 # 6. 로그 디렉토리 생성
 # =============================================================================
-mkdir -p ./logs
+mkdir -p ./logs/focused2
 echo ">>> 로그 경로: $log_path"
 
 # =============================================================================
@@ -213,6 +222,8 @@ echo "Gemini 모델: $gemini_model"
 echo "동시 요청 수: $max_concurrent_requests"
 echo "스트리밍 Reward: $streaming_reward_enable"
 echo "스트리밍 Reward timeout(s): $streaming_reward_timeout"
+echo "Reward Coefs: Judge=$RM_JUDGE_COEF, NDCG=$RM_NDCG_COEF"
+echo "Frozen Reasoning Effort: $FROZEN_REASONING_EFFORT"
 echo "----------------------------------------"
 echo "[Phase 5] Frozen Generator (OpenAI Async)"
 echo "  모델: $frozen_model"
@@ -224,7 +235,7 @@ echo "=========================================="
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    data.train_files=./data/curriculum_bucket_a.parquet \
+    data.train_files=./data/focused_round2.parquet \
     data.val_files=./data/rag/overall_test_crop.parquet \
     data.train_batch_size=$train_batch_size \
     data.max_prompt_length=256 \
@@ -238,6 +249,7 @@ python3 -m verl.trainer.main_ppo \
     +actor_rollout_ref.model.enable_activation_offload=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=$ppo_mini_batch_size \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$ppo_micro_batch_size_per_gpu \
+    actor_rollout_ref.actor.strategy="fsdp" \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.kl_loss_coef=0.0 \
     actor_rollout_ref.actor.kl_loss_type=clipping \
@@ -246,16 +258,19 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.policy_loss_mode="gspo" \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.fsdp_config.param_offload=True \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
     actor_rollout_ref.rollout.free_cache_engine=True \
+    actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.actor.state_masking=True \
+    actor_rollout_ref.actor.use_torch_compile=False \
+    +actor_rollout_ref.actor.fsdp_config.mixed_precision.reduce_dtype=bf16 \
+    +actor_rollout_ref.actor.fsdp_config.mixed_precision.buffer_dtype=bf16 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$log_prob_micro_batch_size_per_gpu \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$tensor_model_parallel_size \
     actor_rollout_ref.rollout.name=$ENGINE \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.3 \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
-    actor_rollout_ref.rollout.enforce_eager=True \
+    +actor_rollout_ref.model.attn_implementation=sdpa \
     actor_rollout_ref.rollout.n=1 \
     actor_rollout_ref.rollout.n_agent=$n_agent \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$log_prob_micro_batch_size_per_gpu \
@@ -280,7 +295,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger=['wandb','console'] \
     trainer.project_name=gspo_phase2_gemini \
-    trainer.experiment_name=gspo_phase2_gemini_flash_curriculum \
+    trainer.experiment_name=gspo_phase2_gemini_flash_curriculum_focused_round_2 \
     trainer.n_gpus_per_node=$n_gpus \
     trainer.nnodes=1 \
     trainer.save_freq=30 \
@@ -289,6 +304,14 @@ python3 -m verl.trainer.main_ppo \
     trainer.resume_mode=auto \
     retriever.url=$search_url \
     max_turns=$max_turns "$@"
+
+exit_code=$?
+if [ $exit_code -ne 0 ]; then
+    echo "=========================================="
+    echo "Training Failed! (exit code: $exit_code)"
+    echo "=========================================="
+    exit $exit_code
+fi
 # =============================================================================
 # 9. 완료
 # =============================================================================
