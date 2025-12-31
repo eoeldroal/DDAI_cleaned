@@ -43,10 +43,12 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
 from verl.utils.tracking import ValidationGenerationsLogger
+from verl.utils.unified_logger import get_unified_logger
 from torch.utils.data import RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 import re
-from vrag_agent.generation import LLMGenerationManager, GenerationConfig
+# NOTE: Generation manager/config are imported lazily inside `fit()` / `_validate()`
+# to support phase-specific pipelines (e.g., Phase 1 without Frozen Generator).
 
 
 #수정 추가 gpu
@@ -341,6 +343,24 @@ class RayPPOTrainer(object):
         self.config = config
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
+
+        # Unified trajectory logging (single-file, best-effort)
+        self.unified_logger = get_unified_logger()
+        if self.unified_logger.enabled:
+            run_id = os.getenv(
+                "UNIFIED_LOG_RUN_ID",
+                f"{self.config.trainer.experiment_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}",
+            )
+            self.unified_logger.set_static_fields(
+                run_id=run_id,
+                project_name=str(self.config.trainer.project_name),
+                experiment_name=str(self.config.trainer.experiment_name),
+                n_agent=int(self.config.actor_rollout_ref.rollout.n_agent),
+            )
+            self.unified_logger.log(
+                "run.start",
+                config=OmegaConf.to_container(self.config, resolve=True),
+            )
 
         # [NEW] 스트리밍 Reward 모드 설정
         # config.reward_model.streaming_reward.enable = True로 활성화
@@ -864,35 +884,59 @@ class RayPPOTrainer(object):
         last_val_metrics = None
 
         # Agent config preparation
-        # [Phase 5] Frozen Generator 비동기 설정 지원
-        frozen_config = getattr(self.config, 'frozen_generator', None) or {}
-        gen_config = GenerationConfig(
-            max_turns=self.config.max_turns,
-            max_prompt_length=99999,
-            num_gpus=self.config.trainer.n_gpus_per_node,
-            n_agent=self.config.actor_rollout_ref.rollout.n_agent,
-            search_url = self.config.retriever.url,
-            # [Phase 5] Frozen Generator 설정 (기본값은 GenerationConfig에서 제공)
-            frozen_model=getattr(frozen_config, 'model', None) or "qwen2.5-vl-72b-instruct",
-            frozen_max_tokens=getattr(frozen_config, 'max_tokens', None) or 1024,
-            frozen_max_concurrent=getattr(frozen_config, 'max_concurrent', None) or 50,
-            frozen_max_retries=getattr(frozen_config, 'max_retries', None) or 3,
-            frozen_backoff_base=getattr(frozen_config, 'backoff_base', None) or 1.5,
-            frozen_total_timeout=float(getattr(frozen_config, 'total_timeout', None) or 60.0),
-            frozen_async_wrapper_timeout=float(getattr(frozen_config, 'async_wrapper_timeout', None) or 60.0),
-            # [NEW] Search API 최적화 설정 반영 (환경 변수 우선)
-            search_batch_size=int(os.getenv("SEARCH_BATCH_SIZE", "32")),
-            search_max_workers=int(os.getenv("SEARCH_MAX_WORKERS", "16")),
-            search_timeout=int(os.getenv("SEARCH_TIMEOUT", "60")),
-        )
+        reward_manager_name = str(getattr(self.config.reward_model, "reward_manager", "naive"))
+        use_phase1_generation = reward_manager_name == "rm_phase1"
 
-        generation_manager = LLMGenerationManager(
-            processor=self.processor,
-            actor_rollout_wg=self.actor_rollout_wg,
-            config=gen_config,
-            # [NEW] 스트리밍 모드일 때만 reward_fn 전달
-            streaming_reward_manager=self.reward_fn if self.streaming_reward_enabled else None,
-        )
+        if use_phase1_generation:
+            # Phase 1: no Frozen Generator, fast tool-use format training
+            from vrag_agent.generation_phase1 import LLMGenerationManager as LLMGenerationManagerPhase1
+            from vrag_agent.generation_phase1 import GenerationConfig as GenerationConfigPhase1
+
+            gen_config = GenerationConfigPhase1(
+                max_turns=self.config.max_turns,
+                max_prompt_length=99999,
+                num_gpus=self.config.trainer.n_gpus_per_node,
+                search_url=self.config.retriever.url,
+            )
+
+            generation_manager = LLMGenerationManagerPhase1(
+                processor=self.processor,
+                actor_rollout_wg=self.actor_rollout_wg,
+                config=gen_config,
+            )
+        else:
+            # Phase 2+: Frozen Generator + (optional) streaming reward
+            from vrag_agent.generation import LLMGenerationManager as LLMGenerationManagerPhase2
+            from vrag_agent.generation import GenerationConfig as GenerationConfigPhase2
+
+            frozen_config = getattr(self.config, 'frozen_generator', None) or {}
+            gen_config = GenerationConfigPhase2(
+                max_turns=self.config.max_turns,
+                max_prompt_length=99999,
+                num_gpus=self.config.trainer.n_gpus_per_node,
+                n_agent=self.config.actor_rollout_ref.rollout.n_agent,
+                search_url=self.config.retriever.url,
+                # [Phase 5] Frozen Generator 설정 (기본값은 GenerationConfig에서 제공)
+                frozen_model=getattr(frozen_config, 'model', None) or "qwen2.5-vl-72b-instruct",
+                frozen_max_tokens=getattr(frozen_config, 'max_tokens', None) or 1024,
+                frozen_max_concurrent=getattr(frozen_config, 'max_concurrent', None) or 50,
+                frozen_max_retries=getattr(frozen_config, 'max_retries', None) or 3,
+                frozen_backoff_base=getattr(frozen_config, 'backoff_base', None) or 1.5,
+                frozen_total_timeout=float(getattr(frozen_config, 'total_timeout', None) or 60.0),
+                frozen_async_wrapper_timeout=float(getattr(frozen_config, 'async_wrapper_timeout', None) or 60.0),
+                # [NEW] Search API 최적화 설정 반영 (환경 변수 우선)
+                search_batch_size=int(os.getenv("SEARCH_BATCH_SIZE", "32")),
+                search_max_workers=int(os.getenv("SEARCH_MAX_WORKERS", "16")),
+                search_timeout=int(os.getenv("SEARCH_TIMEOUT", "60")),
+            )
+
+            generation_manager = LLMGenerationManagerPhase2(
+                processor=self.processor,
+                actor_rollout_wg=self.actor_rollout_wg,
+                config=gen_config,
+                # [NEW] 스트리밍 모드일 때만 reward_fn 전달
+                streaming_reward_manager=self.reward_fn if self.streaming_reward_enabled else None,
+            )
 
         # start training loop
         for epoch in range(self.config.trainer.total_epochs):
@@ -905,6 +949,26 @@ class RayPPOTrainer(object):
                 timing_raw = {}
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+
+                # Unified log: step start (best-effort)
+                if self.unified_logger.enabled:
+                    try:
+                        self.unified_logger.set_static_fields(epoch=int(epoch), global_step=int(self.global_steps))
+                        ids = None
+                        try:
+                            ids = list(batch.non_tensor_batch.get("id", []))
+                        except Exception:
+                            ids = None
+                        self.unified_logger.log(
+                            "train.step.start",
+                            epoch=int(epoch),
+                            global_step=int(self.global_steps),
+                            train_batch_size=int(self.config.data.train_batch_size),
+                            n_agent=int(self.config.actor_rollout_ref.rollout.n_agent),
+                            ids=ids,
+                        )
+                    except Exception:
+                        pass
                 
                 ##grpo_log에 step 추가
                 # 1. 현재 배치의 크기와 디바이스 정보를 가져옵니다.
@@ -958,6 +1022,17 @@ class RayPPOTrainer(object):
                         if self.streaming_reward_enabled:
                             self.reward_fn.start_streaming_mode(num_worker_threads=4)
 
+                        if self.unified_logger.enabled:
+                            try:
+                                self.unified_logger.log(
+                                    "train.generation.start",
+                                    epoch=int(epoch),
+                                    global_step=int(self.global_steps),
+                                    max_turns=int(self.config.max_turns),
+                                )
+                            except Exception:
+                                pass
+
                         ###
                         generation_manager.timing_raw = timing_raw
                         final_gen_batch_output = generation_manager.run_llm_loop(
@@ -965,6 +1040,16 @@ class RayPPOTrainer(object):
                             initial_input_ids=first_input_ids,
                         )
                         gen_monitor.stop() #수정 추가 gpu 
+
+                        if self.unified_logger.enabled:
+                            try:
+                                self.unified_logger.log(
+                                    "train.generation.end",
+                                    epoch=int(epoch),
+                                    global_step=int(self.global_steps),
+                                )
+                            except Exception:
+                                pass
 
                     # final_gen_batch_output.batch.apply(lambda x: x.long(), inplace=True)
                     for key in final_gen_batch_output.batch.keys():
@@ -1136,6 +1221,18 @@ class RayPPOTrainer(object):
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 
+                # Unified log: step metrics snapshot (best-effort)
+                if self.unified_logger.enabled:
+                    try:
+                        self.unified_logger.log(
+                            "train.step.metrics",
+                            epoch=int(epoch),
+                            global_step=int(self.global_steps),
+                            metrics=deepcopy(metrics),
+                        )
+                    except Exception:
+                        pass
+
                 if is_last_step:
                     pprint(f'Final validation metrics: {last_val_metrics}')
                     return
@@ -1245,22 +1342,49 @@ class RayPPOTrainer(object):
         # Lists to collect samples for the table
         sample_inputs = []
 
-        gen_config = GenerationConfig(
-            max_turns=5,
-            max_prompt_length=99999,
-            num_gpus=self.config.trainer.n_gpus_per_node,
-            n_agent=self.config.actor_rollout_ref.rollout.n_agent,
-            search_url = self.config.retriever.url,
-            frozen_total_timeout=float(getattr(frozen_config, 'total_timeout', None) or 60.0),
-            frozen_async_wrapper_timeout=float(getattr(frozen_config, 'async_wrapper_timeout', None) or 60.0),
-        )
+        reward_manager_name = str(getattr(self.config.reward_model, "reward_manager", "naive"))
+        use_phase1_generation = reward_manager_name == "rm_phase1"
 
-        generation_manager = LLMGenerationManager(
-            processor=self.processor,
-            actor_rollout_wg=self.actor_rollout_wg,
-            config=gen_config,
-            is_validation = True
-        )
+        if use_phase1_generation:
+            from vrag_agent.generation_phase1 import LLMGenerationManager as LLMGenerationManagerPhase1
+            from vrag_agent.generation_phase1 import GenerationConfig as GenerationConfigPhase1
+
+            gen_config = GenerationConfigPhase1(
+                max_turns=5,
+                max_prompt_length=99999,
+                num_gpus=self.config.trainer.n_gpus_per_node,
+                search_url=self.config.retriever.url,
+            )
+            generation_manager = LLMGenerationManagerPhase1(
+                processor=self.processor,
+                actor_rollout_wg=self.actor_rollout_wg,
+                config=gen_config,
+                is_validation=True,
+            )
+        else:
+            from vrag_agent.generation import LLMGenerationManager as LLMGenerationManagerPhase2
+            from vrag_agent.generation import GenerationConfig as GenerationConfigPhase2
+
+            frozen_config = getattr(self.config, 'frozen_generator', None) or {}
+            gen_config = GenerationConfigPhase2(
+                max_turns=5,
+                max_prompt_length=99999,
+                num_gpus=self.config.trainer.n_gpus_per_node,
+                n_agent=self.config.actor_rollout_ref.rollout.n_agent,
+                search_url=self.config.retriever.url,
+                frozen_total_timeout=float(getattr(frozen_config, 'total_timeout', None) or 60.0),
+                frozen_async_wrapper_timeout=float(getattr(frozen_config, 'async_wrapper_timeout', None) or 60.0),
+                # [NEW] Search API 최적화 설정 반영 (환경 변수 우선)
+                search_batch_size=int(os.getenv("SEARCH_BATCH_SIZE", "32")),
+                search_max_workers=int(os.getenv("SEARCH_MAX_WORKERS", "16")),
+                search_timeout=int(os.getenv("SEARCH_TIMEOUT", "60")),
+            )
+            generation_manager = LLMGenerationManagerPhase2(
+                processor=self.processor,
+                actor_rollout_wg=self.actor_rollout_wg,
+                config=gen_config,
+                is_validation=True,
+            )
 
         
         for test_data in self.val_dataloader:
@@ -1349,8 +1473,3 @@ class RayPPOTrainer(object):
         metric_dict[f'val/test_score/overall'] = np.mean(overall_rewards)
         
         return metric_dict
-
-
-
-
-

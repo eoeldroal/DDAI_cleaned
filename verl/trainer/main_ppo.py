@@ -137,7 +137,7 @@ class TaskRunner:
             role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
             mapping[Role.RewardModel] = global_pool_id
 
-        #핵심
+        # Reward manager selection
         reward_manager_name = config.reward_model.get("reward_manager", "naive")
         if reward_manager_name == 'naive':
             from verl.workers.reward_manager import NaiveRewardManager
@@ -145,15 +145,19 @@ class TaskRunner:
         elif reward_manager_name == 'prime':
             from verl.workers.reward_manager import PrimeRewardManager
             reward_manager_cls = PrimeRewardManager
-        #rm이 호출
-        elif reward_manager_name == 'rm':
+        elif reward_manager_name in ('rm', 'rm_phase2'):
+            # Phase 2: Gemini Judge (+ NDCG)
             from verl.workers.reward_manager import RMManager
             reward_manager_cls = RMManager
+        elif reward_manager_name == 'rm_phase1':
+            # Phase 1: (gate) 0.1*format + 0.9*ndcg
+            from verl.workers.reward_manager.rm_phase1 import RMManager as RMPhase1Manager
+            reward_manager_cls = RMPhase1Manager
         else:
             raise NotImplementedError
 
         compute_score = get_custom_reward_fn(config)
-        if config.reward_model.get("reward_manager", "naive") == 'rm':
+        if reward_manager_name in ('rm', 'rm_phase2'):
             # rm_phase2.py uses Gemini API directly, so pass Gemini-specific parameters
             reward_fn = reward_manager_cls(
                 tokenizer=tokenizer,
@@ -163,6 +167,13 @@ class TaskRunner:
                 gemini_model=config.reward_model.get("gemini_model", "gemini-3-flash-preview"),
                 image_base_path=config.reward_model.get("image_base_path", "./data/images"),
                 max_concurrent_requests=config.reward_model.get("max_concurrent_requests", 50),
+            )
+        elif reward_manager_name == 'rm_phase1':
+            reward_fn = reward_manager_cls(
+                tokenizer=tokenizer,
+                num_examine=0,
+                compute_score=compute_score,
+                log_path=config.reward_model.get("log_path", "./logs/grpo_log.json"),
             )
         else:
             reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=0, compute_score=compute_score)
