@@ -353,7 +353,7 @@ def _messages_from_events_v1(
                 m = re.search(r"<search>(.*?)</search>", text, flags=re.DOTALL | re.IGNORECASE)
                 has_search = bool(m and isinstance(m.group(1), str) and m.group(1).strip())
             elif first_action == "<bbox>":
-                m = re.search(r"<bbox>\\s*\\[(.*?)\\]\\s*</bbox>", text, flags=re.DOTALL | re.IGNORECASE)
+                m = re.search(r"<bbox>\s*\[(.*?)\]\s*</bbox>", text, flags=re.DOTALL | re.IGNORECASE)
                 if m and isinstance(m.group(1), str):
                     parts = [p.strip() for p in m.group(1).split(",")]
                     if len(parts) == 4:

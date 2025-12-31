@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Filter train1-style SFT Parquet by search-query corruption using GPT (gpt-5-mini).
+Filter train1-style SFT Parquet by search-query corruption using GPT (default: gpt-5.2).
 
 Goal:
   - Keep the original trajectories/messages intact.
@@ -62,12 +62,6 @@ def _get_openai_async_client():
     primary_key = os.getenv("OPENAI_API_KEY")
     primary_base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("FROZEN_OPENAI_BASE_URL")
 
-    fallback_key = os.getenv("DASHSCOPE_API_KEY") or os.getenv("DASH_SCOPE_KEY")
-    fallback_base_url = os.getenv(
-        "DASHSCOPE_OPENAI_BASE_URL",
-        "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
-    )
-
     api_key = primary_key or fallback_key
     base_url = primary_base_url or (fallback_base_url if fallback_key else None) or "https://api.openai.com/v1"
 
@@ -79,8 +73,8 @@ def _get_openai_async_client():
     return AsyncOpenAI(
         api_key=api_key,
         base_url=base_url,
-        timeout=60.0,
-        max_retries=0,
+        timeout=1000.0,
+        max_retries=10,
     )
 
 
@@ -214,6 +208,7 @@ async def _judge_one(
 
     async with semaphore:
         response = await client.responses.create(**kwargs)
+        print(response)
 
     text = getattr(response, "output_text", None) or ""
     parsed = _extract_json(text)
@@ -282,9 +277,9 @@ async def main_async() -> int:
     ap.add_argument("--output", required=True, help="Output Parquet (filtered)")
     ap.add_argument("--report", default=None, help="JSONL report path (optional)")
     ap.add_argument("--cache", default=None, help="JSONL cache path (optional)")
-    ap.add_argument("--model", default=os.getenv("FILTER_MODEL", "gpt-5-mini-2025-08-07"))
-    ap.add_argument("--reasoning-effort", default=os.getenv("FILTER_REASONING_EFFORT", os.getenv("FROZEN_REASONING_EFFORT", "minimal")))
-    ap.add_argument("--max-output-tokens", type=int, default=400)
+    ap.add_argument("--model", default=os.getenv("FILTER_MODEL", "gpt-5.2-2025-12-11"))
+    ap.add_argument("--reasoning-effort", default=os.getenv("FILTER_REASONING_EFFORT", os.getenv("FROZEN_REASONING_EFFORT", "medium")))
+    ap.add_argument("--max-output-tokens", type=int, default=60000)
     ap.add_argument("--limit", type=int, default=10, help="How many rows to evaluate (default: 10)")
     ap.add_argument("--sample", choices=["first", "random"], default="random")
     ap.add_argument("--seed", type=int, default=0)
