@@ -402,6 +402,11 @@ class RMManager:
         self.tokenizer = tokenizer
         self.log_path = log_path
         self.image_base_path = image_base_path
+        # Optional: rule-based format reward (custom_reward_function)
+        # When enabled (RM_FORMAT_COEF>0), format is treated as a hard gate:
+        #   if format_score == 0 -> final_score = 0
+        #   else final_score = format_coef*format + judge_coef*judge + ndcg_coef*ndcg
+        self.compute_score = compute_score
 
         # =========================================================================
         # [NEW] Gemini Judge 상세 로깅 설정
@@ -424,7 +429,16 @@ class RMManager:
         # =========================================================================
         self.judge_coef = float(os.getenv("RM_JUDGE_COEF", "0.8"))
         self.ndcg_coef = float(os.getenv("RM_NDCG_COEF", "0.2"))
-        print(f"[RMManager] Reward Coefficients: Judge={self.judge_coef}, NDCG={self.ndcg_coef}")
+        self.format_coef = float(os.getenv("RM_FORMAT_COEF", "0.0"))
+        print(
+            f"[RMManager] Reward Coefficients: Judge={self.judge_coef}, "
+            f"NDCG={self.ndcg_coef}, Format={self.format_coef}"
+        )
+        if self.format_coef > 0.0 and self.compute_score is None:
+            raise ValueError(
+                "RM_FORMAT_COEF > 0 requires a custom_reward_function (format checker), "
+                "but compute_score is None. Check custom_reward_function.path/name."
+            )
 
         # =========================================================================
         # Gemini SDK 초기화 (Structured Output 설정)
@@ -511,6 +525,33 @@ class RMManager:
         # 기존 구현은 2번 순회했지만, 여기서는 1번만 순회하며 모든 정보 추출
         preprocessed = []
 
+        def _compute_format_score(
+            data_source: str,
+            solution_str: str,
+            ground_truth: str,
+            extra_info: dict,
+        ) -> tuple[float, str | None]:
+            if self.format_coef <= 0.0:
+                return 1.0, None
+            if self.compute_score is None:
+                return 1.0, None
+            try:
+                out = self.compute_score(
+                    data_source=data_source,
+                    solution_str=solution_str,
+                    ground_truth=ground_truth,
+                    extra_info=extra_info,
+                )
+                # Backward-compat: some compute_score returns float, others return (score, reason)
+                if isinstance(out, tuple) and len(out) >= 1:
+                    score = float(out[0]) if out[0] is not None else 0.0
+                    reason = out[1] if len(out) >= 2 else None
+                    return score, reason
+                return float(out) if out is not None else 0.0, None
+            except Exception as e:
+                # Fail-closed: if format checker errors, treat as fail (gate to 0)
+                return 0.0, f"format_checker_error: {e}"
+
         for i in range(len(data)):
             data_item = data[i]
 
@@ -537,6 +578,10 @@ class RMManager:
             # -----------------------------------------------------------------
             extra_info = data_item.non_tensor_batch.get('extra_info', {})
             ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
+            data_source = data_item.non_tensor_batch.get('data_source', 'unknown')
+            uid_val = data_item.non_tensor_batch.get('uid', None)
+            if uid_val is None:
+                uid_val = data_item.non_tensor_batch.get('id', None)
 
             # -----------------------------------------------------------------
             # 2.4 이미지 경로 추출
@@ -566,10 +611,23 @@ class RMManager:
                 generated_answer = "Please Judge False"  # 기존 방식과 동일
 
             # -----------------------------------------------------------------
-            # 2.6 전처리 결과 저장
+            # 2.6 format reward (optional, hard gate)
+            # -----------------------------------------------------------------
+            format_score, format_fail_reason = _compute_format_score(
+                data_source=str(data_source),
+                solution_str=response_str,
+                ground_truth=ground_truth,
+                extra_info=extra_info,
+            )
+            format_pass = float(format_score) > 0.0
+
+            # -----------------------------------------------------------------
+            # 2.7 전처리 결과 저장
             # -----------------------------------------------------------------
             preprocessed.append({
                 'index': i,
+                'uid': str(uid_val) if uid_val is not None else None,
+                'data_source': str(data_source),
                 'response_str': response_str,           # 전체 추론 경로 (로깅용)
                 'generated_answer': generated_answer,   # <answer> 내용만 (평가용)
                 'valid_response_length': valid_response_length,
@@ -577,6 +635,9 @@ class RMManager:
                 'reference_answer': ground_truth,
                 'retrieved_basenames': retrieved_basenames,      # NDCG용
                 'reference_basenames': reference_basenames,      # NDCG용
+                'format_score': float(format_score),
+                'format_pass': bool(format_pass),
+                'format_fail_reason': format_fail_reason,
             })
 
         # =========================================================================
@@ -585,7 +646,17 @@ class RMManager:
         # 성능 비교:
         # - 순차 처리: 32개 샘플 × 2초 = 64초
         # - 비동기 처리 (10개 동시): 32 / 10 × 2초 ≈ 7초 (~9배 향상)
-        judge_results = self._run_async_batch_evaluate(preprocessed)
+        # If format gating is enabled, skip Gemini calls for format-fail samples.
+        if self.format_coef > 0.0:
+            eval_items = [item for item in preprocessed if item.get('format_pass', False)]
+            eval_results = self._run_async_batch_evaluate(eval_items) if eval_items else []
+            judge_results = [self._default_result("skipped_due_to_format_fail")] * len(preprocessed)
+            for item, res in zip(eval_items, eval_results):
+                idx = int(item.get('index', -1))
+                if 0 <= idx < len(judge_results):
+                    judge_results[idx] = res
+        else:
+            judge_results = self._run_async_batch_evaluate(preprocessed)
 
         # =========================================================================
         # 4. 점수 계산 및 텐서 할당
@@ -593,6 +664,8 @@ class RMManager:
         metrics = {
             'ndcg': [],
             'judge_score': [],      # True=1.0, False=0.0
+            'format_score': [],
+            'format_pass': [],
             'final_score': [],
         }
         log_entries = []
@@ -613,9 +686,20 @@ class RMManager:
             # -----------------------------------------------------------------
             # 4.3 최종 점수 계산: 0.8 * Judge + 0.2 * NDCG
             # -----------------------------------------------------------------
-            # Final score: coef * judge + coef * ndcg (env: RM_JUDGE_COEF / RM_NDCG_COEF)
+            # Final score:
+            # - default: judge_coef*judge + ndcg_coef*ndcg
+            # - if RM_FORMAT_COEF>0: hard gate on format_score
             try:
-                final_score = self.judge_coef * float(judge_score) + self.ndcg_coef * float(ndcg_value)
+                format_score = float(item.get('format_score', 1.0))
+                format_pass = bool(item.get('format_pass', True))
+                if self.format_coef > 0.0 and not format_pass:
+                    final_score = 0.0
+                else:
+                    final_score = (
+                        (self.format_coef * float(format_score) if self.format_coef > 0.0 else 0.0)
+                        + self.judge_coef * float(judge_score)
+                        + self.ndcg_coef * float(ndcg_value)
+                    )
             except Exception:
                 final_score = 0.0
 
@@ -630,15 +714,22 @@ class RMManager:
             # -----------------------------------------------------------------
             metrics['ndcg'].append(ndcg_value)
             metrics['judge_score'].append(judge_score)
+            metrics['format_score'].append(float(item.get('format_score', 1.0)))
+            metrics['format_pass'].append(1.0 if item.get('format_pass', True) else 0.0)
             metrics['final_score'].append(final_score)
 
             # -----------------------------------------------------------------
             # 4.6 로그 엔트리 생성
             # -----------------------------------------------------------------
             log_entries.append({
+                'uid': item.get('uid'),
+                'data_source': item.get('data_source'),
                 'query': item['query'],
                 'generated_answer': item['generated_answer'],
                 'reference_answer': item['reference_answer'],
+                'format_score': float(item.get('format_score', 1.0)),
+                'format_pass': bool(item.get('format_pass', True)),
+                'format_fail_reason': item.get('format_fail_reason'),
                 'judge_score': judge_score,
                 'ndcg': ndcg_value,
                 'final_score': final_score,
@@ -671,6 +762,8 @@ class RMManager:
         avg_metrics = {
             'reward/ndcg_mean': safe_mean(metrics['ndcg']),
             'reward/judge_score_mean': safe_mean(metrics['judge_score']),
+            'reward/format_score_mean': safe_mean(metrics['format_score']),
+            'reward/format_pass_rate': safe_mean(metrics['format_pass']),
             'reward/final_score_mean': safe_mean(metrics['final_score']),
         }
 
@@ -1034,6 +1127,12 @@ class RMManager:
         if self._streaming_mode:
             print("[RMManager] 스트리밍 모드가 이미 활성화되어 있습니다.")
             return
+
+        if self.format_coef > 0.0:
+            raise RuntimeError(
+                "Format gating (RM_FORMAT_COEF>0) is not supported in streaming reward mode yet. "
+                "Disable reward_model.streaming_reward.enable."
+            )
 
         self._streaming_mode = True
         # Event loop 단일화: 워커 수를 1로 고정하고, 동시성은 세마포어로 제어
