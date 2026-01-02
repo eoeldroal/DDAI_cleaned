@@ -41,6 +41,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from verl.utils.fsdp_utils import get_fsdp_wrap_policy, init_fn, get_init_weight_context_manager
 from verl.utils.dataset import SFTDataset
+from verl.utils.dataset.sft_dataset import sft_multimodal_collate_fn
 from verl.utils.fs import copy_to_local
 from verl.utils.tracking import Tracking
 from verl.utils.ulysses import get_ulysses_sequence_parallel_world_size, set_ulysses_sequence_parallel_group
@@ -177,7 +178,8 @@ class FSDPSFTTrainer(object):
                                            sampler=self.train_sampler,
                                            num_workers=8,
                                            pin_memory=True,
-                                           drop_last=True)
+                                           drop_last=True,
+                                           collate_fn=sft_multimodal_collate_fn)
 
         self.val_sampler = DistributedSampler(self.val_dataset,
                                               shuffle=False,
@@ -189,7 +191,8 @@ class FSDPSFTTrainer(object):
                                          sampler=self.val_sampler,
                                          num_workers=8,
                                          pin_memory=True,
-                                         drop_last=True)
+                                         drop_last=True,
+                                         collate_fn=sft_multimodal_collate_fn)
 
     def _build_model_optimizer(self):
         # TODO (zhangchi.usc1992):
@@ -231,17 +234,23 @@ class FSDPSFTTrainer(object):
             # load config first
             config = AutoConfig.from_pretrained(local_model_path, trust_remote_code=trust_remote_code)
 
-            # Disable flash attention 2
-            config._attn_implementation = "eager"
-            config.attn_implementation = "eager"
+            # Select attention implementation.
+            # NOTE: We do not force "eager" here because long-context SFT (e.g., 9k) can OOM with eager attention.
+            # Keep it configurable via Hydra: `model.attention_impl=sdpa|eager|...`
+            attention_impl = getattr(self.config.model, "attention_impl", None)
+            if attention_impl is not None:
+                config._attn_implementation = attention_impl
+                config.attn_implementation = attention_impl
 
             with init_context():
-                self.model = AutoModelForVision2Seq.from_pretrained(
-                    local_model_path,
+                model_kwargs = dict(
                     config=config,
                     torch_dtype=torch.bfloat16,
-                    trust_remote_code=True
+                    trust_remote_code=True,
                 )
+                if attention_impl is not None:
+                    model_kwargs["attn_implementation"] = attention_impl
+                self.model = AutoModelForVision2Seq.from_pretrained(local_model_path, **model_kwargs)
 
             ###########
 
@@ -351,13 +360,43 @@ class FSDPSFTTrainer(object):
         context = nullcontext()
         with context:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                # Optional multimodal inputs (Qwen2.5-VL / AutoModelForVision2Seq)
+                pixel_values = batch.get("pixel_values")
+                patch_attention_mask = batch.get("patch_attention_mask")
+                image_grid_thw = batch.get("image_grid_thw")
+                image_attention_mask = batch.get("image_attention_mask")
+
+                if pixel_values is not None:
+                    pixel_values = pixel_values.to(input_ids.device, non_blocking=True)
+                if patch_attention_mask is not None:
+                    patch_attention_mask = patch_attention_mask.to(input_ids.device, non_blocking=True)
+                if image_grid_thw is not None:
+                    image_grid_thw = image_grid_thw.to(input_ids.device, non_blocking=True)
+                if image_attention_mask is not None:
+                    image_attention_mask = image_attention_mask.to(input_ids.device, non_blocking=True)
+
                 if not use_sp:
                     # Standard forward pass without sequence parallel
                     labels = input_ids[:, 1:].contiguous()
-                    output = self.fsdp_model(input_ids=input_ids,
-                                             attention_mask=attention_mask,
-                                             position_ids=position_ids,
-                                             use_cache=False)
+                    fwd_kwargs = dict(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        use_cache=False,
+                    )
+                    # Pass multimodal fields only if present.
+                    if pixel_values is not None:
+                        if patch_attention_mask is None:
+                            raise RuntimeError("pixel_values provided but patch_attention_mask missing")
+                        # (B, max_patches, D) -> (total_patches, D)
+                        fwd_kwargs["pixel_values"] = pixel_values[patch_attention_mask.bool()]
+                    if image_grid_thw is not None:
+                        if image_attention_mask is None:
+                            raise RuntimeError("image_grid_thw provided but image_attention_mask missing")
+                        # (B, max_images, 3) -> (total_images, 3)
+                        fwd_kwargs["image_grid_thw"] = image_grid_thw[image_attention_mask.bool()]
+
+                    output = self.fsdp_model(**fwd_kwargs)
                     logits = output.logits
 
                     shift_logits = logits[..., :-1, :].contiguous()
@@ -368,7 +407,8 @@ class FSDPSFTTrainer(object):
                     # Enable model parallelism
                     shift_labels = shift_labels.to(shift_logits.device)
                     loss = loss_fct(shift_logits, shift_labels)
-                    loss = loss * loss_mask.to(loss.device)
+                    # NOTE: Do not multiply by loss_mask here because NaN * 0 = NaN, which can poison the whole loss
+                    # even if NaNs only appear in masked-out (non-training) positions.
                 else:
                     # IMPORTANT: We have a big assumption here, so we can shard the SAME sequence across SP ranks
                     # i.e., each GPU has <1 sequence, and each SP group has 1 sequence
@@ -396,11 +436,22 @@ class FSDPSFTTrainer(object):
                     input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
 
                     # Forward pass
-                    output = self.fsdp_model(
+                    fwd_kwargs = dict(
                         input_ids=input_ids_rmpad_sliced,
                         attention_mask=None,  # Not needed with flash attention varlen
                         position_ids=position_ids_rmpad_padded,
-                        use_cache=False)
+                        use_cache=False,
+                    )
+                    if pixel_values is not None:
+                        if patch_attention_mask is None:
+                            raise RuntimeError("pixel_values provided but patch_attention_mask missing")
+                        fwd_kwargs["pixel_values"] = pixel_values[patch_attention_mask.bool()]
+                    if image_grid_thw is not None:
+                        if image_attention_mask is None:
+                            raise RuntimeError("image_grid_thw provided but image_attention_mask missing")
+                        fwd_kwargs["image_grid_thw"] = image_grid_thw[image_attention_mask.bool()]
+
+                    output = self.fsdp_model(**fwd_kwargs)
 
                     # Compute loss locally then aggregate
                     logits_rmpad = output.logits.squeeze(0)
@@ -417,9 +468,45 @@ class FSDPSFTTrainer(object):
                     full_loss = full_loss.squeeze(-1)[:, :-1]  # Remove last token's loss
                     full_loss = full_loss.reshape(-1)
                     loss_mask = loss_mask.to(full_loss.device)
-                    loss = full_loss * loss_mask
+                    loss = full_loss
 
-                valid_token_this_rank = torch.sum(loss_mask)
+                loss_mask = loss_mask.to(loss.device)
+                loss_mask_bool = loss_mask.to(torch.bool)
+
+                finite_loss = torch.isfinite(loss)
+                nonfinite_on_train = (~finite_loss) & loss_mask_bool
+                if nonfinite_on_train.any() and self.device_mesh.get_rank() == 0:
+                    # Best-effort debug to identify problematic samples/batches.
+                    try:
+                        sample_idx = batch.get("sample_idx")
+                        if sample_idx is not None:
+                            sample_idx = sample_idx.detach().cpu().tolist()
+                        else:
+                            sample_idx = None
+                        seqlens = attention_mask.sum(dim=1).detach().cpu().tolist()
+                        image_token_id = getattr(self.model.config, "image_token_id", None)
+                        image_tokens = None
+                        if image_token_id is not None:
+                            image_tokens = (input_ids == int(image_token_id)).sum(dim=1).detach().cpu().tolist()
+                        image_counts = None
+                        image_attention_mask = batch.get("image_attention_mask")
+                        if image_attention_mask is not None:
+                            image_counts = image_attention_mask.sum(dim=1).detach().cpu().tolist()
+
+                        n_bad = int(nonfinite_on_train.sum().item())
+                        n_train = int(loss_mask_bool.sum().item())
+                        print(
+                            f"[WARN] Non-finite token-loss on training tokens: bad={n_bad} / train_tokens={n_train} "
+                            f"| sample_idx={sample_idx} | seqlen={seqlens} | n_images={image_counts} | n_image_tokens={image_tokens}"
+                        )
+                    except Exception:
+                        print("[WARN] Non-finite token-loss on training tokens (failed to extract debug metadata).")
+
+                # Exclude non-finite losses (including those on training tokens) from the reduction to prevent NaN poisoning.
+                effective_mask_bool = loss_mask_bool & finite_loss
+                loss = loss.masked_fill(~effective_mask_bool, 0.0)
+
+                valid_token_this_rank = torch.sum(effective_mask_bool)
 
                 if self.config.data.balance_dp_token:
                     torch.distributed.all_reduce(valid_token_this_rank)
@@ -427,7 +514,7 @@ class FSDPSFTTrainer(object):
                 else:
                     dp_size = 1
 
-                loss = torch.sum(loss) / valid_token_this_rank * dp_size
+                loss = torch.sum(loss) / torch.clamp(valid_token_this_rank, min=1) * dp_size
 
                 if do_backward:
                     loss.backward()

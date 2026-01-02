@@ -496,6 +496,7 @@ def filter_trajectories(
     max_turns: Optional[int] = None,
     best_only: bool = False,
     min_success_rate: float = 0.0,
+    max_success_rate: Optional[float] = None,
     top_k: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
@@ -507,6 +508,7 @@ def filter_trajectories(
         max_turns: 최대 턴 수 (default: None = 제한 없음)
         best_only: 샘플당 best rollout만 선택 (default: False)
         min_success_rate: 최소 성공률 (default: 0.0)
+        max_success_rate: 최대 성공률 (default: None = 제한 없음)
         top_k: 샘플당 상위 K개 rollout만 유지 (default: None=제한 없음)
     """
     filtered_samples = {}
@@ -518,6 +520,8 @@ def filter_trajectories(
         success_rate = success / total if total > 0 else 0
 
         if success_rate < min_success_rate:
+            continue
+        if max_success_rate is not None and success_rate > float(max_success_rate):
             continue
 
         # rollout 필터링
@@ -560,6 +564,7 @@ def filter_trajectories(
             'max_turns': max_turns,
             'best_only': best_only,
             'min_success_rate': min_success_rate,
+            'max_success_rate': max_success_rate,
             'top_k': top_k,
         },
         'samples': filtered_samples
@@ -691,6 +696,7 @@ def main():
     parser.add_argument('--top-k', type=int, default=None,
                         help='Keep only top-K rollouts per sample (sorted by score, then ndcg). Ignored if <=0.')
     parser.add_argument('--min-success-rate', type=float, default=0.0, help='Minimum success rate filter')
+    parser.add_argument('--max-success-rate', type=float, default=None, help='Maximum success rate filter (default: None)')
     parser.add_argument('--sft-format', action='store_true', help='Output in SFT format')
     parser.add_argument('--include-raw', action='store_true', help='Include raw trajectory in SFT format')
     parser.add_argument('--stats', action='store_true', help='Print statistics')
@@ -714,8 +720,22 @@ def main():
     print(f"Extracted {len(data['samples'])} samples")
 
     # 필터링
-    if args.min_score > 0 or args.min_ndcg > 0 or args.max_turns or args.best_only or args.top_k or args.min_success_rate > 0:
-        print(f"Filtering (score>={args.min_score}, ndcg>={args.min_ndcg}, turns<={args.max_turns}, best_only={args.best_only}, top_k={args.top_k})...")
+    if (
+        args.min_score > 0
+        or args.min_ndcg > 0
+        or args.max_turns
+        or args.best_only
+        or args.top_k
+        or args.min_success_rate > 0
+        or args.max_success_rate is not None
+    ):
+        print(
+            "Filtering ("
+            f"score>={args.min_score}, ndcg>={args.min_ndcg}, turns<={args.max_turns}, "
+            f"best_only={args.best_only}, top_k={args.top_k}, "
+            f"success_rate>={args.min_success_rate}, success_rate<={args.max_success_rate}"
+            ")..."
+        )
         data = filter_trajectories(
             data,
             min_score=args.min_score,
@@ -723,6 +743,7 @@ def main():
             max_turns=args.max_turns,
             best_only=args.best_only,
             min_success_rate=args.min_success_rate,
+            max_success_rate=args.max_success_rate,
             top_k=args.top_k,
         )
         print(f"After filtering: {len(data['samples'])} samples")

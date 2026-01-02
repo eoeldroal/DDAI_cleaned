@@ -70,6 +70,7 @@ from typing import Dict, List, Optional
 import google.generativeai as genai
 
 from verl.utils.unified_logger import get_unified_logger
+from verl.utils.api_latency import ApiLatencyConfig, ApiLatencyStats
 
 _UNIFIED_LOGGER = get_unified_logger()
 
@@ -147,6 +148,8 @@ _FLASH_RM_LOG_MAX_LINES = int(os.getenv("FLASH_RM_LOG_MAX_LINES", "500000"))
 _FLASH_RM_LOG_PATH = os.getenv("FLASH_RM_LOG_PATH", "./logs/flash_rm_detail.jsonl")
 _flash_rm_log_lock = threading.Lock()
 _flash_rm_log_lines = 0
+_GEMINI_DETAIL_LOG_ENABLED = os.getenv("GEMINI_DETAIL_LOG", "0").lower() in ("1", "true", "yes", "y")
+_GEMINI_DETAIL_CONSOLE_ENABLED = os.getenv("GEMINI_DETAIL_CONSOLE", "1").lower() in ("1", "true", "yes", "y")
 
 
 def _ndcg_debug_write(payload: dict) -> None:
@@ -411,9 +414,12 @@ class RMManager:
         # =========================================================================
         # [NEW] Gemini Judge 상세 로깅 설정
         # =========================================================================
+        self._gemini_detail_log_enabled = bool(_GEMINI_DETAIL_LOG_ENABLED)
+        self._gemini_detail_console_enabled = bool(_GEMINI_DETAIL_CONSOLE_ENABLED)
         self.gemini_detail_log_path = log_path.replace('.jsonl', '_gemini_detail.jsonl')
-        os.makedirs(os.path.dirname(self.gemini_detail_log_path) or '.', exist_ok=True)
-        print(f"[RMManager] Gemini Judge 상세 로그: {self.gemini_detail_log_path}")
+        if self._gemini_detail_log_enabled:
+            os.makedirs(os.path.dirname(self.gemini_detail_log_path) or '.', exist_ok=True)
+            print(f"[RMManager] Gemini Judge 상세 로그: {self.gemini_detail_log_path}")
 
         # =========================================================================
         # 비동기 배치 처리 설정
@@ -480,6 +486,25 @@ class RMManager:
             self.verbose_gemini_level = int(_gemini_verbose)
         except ValueError:
             self.verbose_gemini_level = 1 if str(_gemini_verbose).lower() in ("1", "true", "t", "yes") else 0
+
+        # =========================================================================
+        # API latency stats (Gemini)
+        # =========================================================================
+        self._api_latency_cfg = ApiLatencyConfig.from_env(prefix="GEMINI")
+        self._gemini_semaphore_wait_s = ApiLatencyStats(
+            name="gemini.semaphore_wait",
+            event_prefix="api.gemini.semaphore_wait",
+            cfg=self._api_latency_cfg,
+            logger=_UNIFIED_LOGGER,
+            static_fields={"gemini_model": gemini_model},
+        )
+        self._gemini_request_s = ApiLatencyStats(
+            name="gemini.generate_content_async",
+            event_prefix="api.gemini.request",
+            cfg=self._api_latency_cfg,
+            logger=_UNIFIED_LOGGER,
+            static_fields={"gemini_model": gemini_model},
+        )
 
         # =========================================================================
         # 스트리밍 모드 설정
@@ -879,7 +904,13 @@ class RMManager:
         Returns:
             LLM Judge 평가 결과 딕셔너리 (is_correct: bool)
         """
+        wait_t0 = time.perf_counter()
         async with semaphore:
+            wait_s = time.perf_counter() - wait_t0
+            try:
+                self._gemini_semaphore_wait_s.observe(wait_s, ok=True, sample_local_idx=int(idx))
+            except Exception:
+                pass
             # 1. LLM 입력 준비 (텍스트 프롬프트만)
             prompt = self._prepare_llm_input(item)
 
@@ -890,7 +921,18 @@ class RMManager:
             for attempt in range(max_retries):
                 try:
                     # 텍스트만 전송 (이미지 없음)
+                    t0 = time.perf_counter()
                     response = await self.gemini.generate_content_async(prompt)
+                    api_s = time.perf_counter() - t0
+                    try:
+                        self._gemini_request_s.observe(
+                            api_s,
+                            ok=True,
+                            sample_local_idx=int(idx),
+                            attempt=int(attempt + 1),
+                        )
+                    except Exception:
+                        pass
                     raw_response_text = response.text
                     parsed_result = self._parse_llm_response(raw_response_text)
 
@@ -911,6 +953,17 @@ class RMManager:
                     return parsed_result
 
                 except Exception as e:
+                    try:
+                        api_s = time.perf_counter() - t0
+                        self._gemini_request_s.observe(
+                            api_s,
+                            ok=False,
+                            sample_local_idx=int(idx),
+                            attempt=int(attempt + 1),
+                            error=str(e),
+                        )
+                    except Exception:
+                        pass
                     last_error = e
                     # 마지막 시도가 아니면 재시도
                     if attempt < max_retries - 1:
@@ -953,6 +1006,8 @@ class RMManager:
 
         입력 프롬프트와 출력 응답을 JSONL 파일과 콘솔에 기록합니다.
         """
+        if not getattr(self, "_gemini_detail_log_enabled", False):
+            return
         import datetime
 
         log_entry = {
@@ -974,14 +1029,18 @@ class RMManager:
             pass
 
         # 콘솔 출력 (간략 버전)
-        status = "SUCCESS" if error is None else f"ERROR: {error}"
-        print(f"\n{'='*60}")
-        print(f"[Gemini Judge] Sample {idx} | Score: {parsed_score:.2f} | {status}")
-        print(f"  Query: {query[:100]}{'...' if len(query) > 100 else ''}")
-        print(f"  Generated: {generated_answer[:100]}{'...' if len(generated_answer) > 100 else ''}")
-        print(f"  Reference: {reference_answer[:100]}{'...' if len(reference_answer) > 100 else ''}")
-        print(f"  Gemini Response: {gemini_response[:200] if gemini_response else 'None'}{'...' if gemini_response and len(gemini_response) > 200 else ''}")
-        print(f"{'='*60}\n")
+        if getattr(self, "_gemini_detail_console_enabled", False):
+            status = "SUCCESS" if error is None else f"ERROR: {error}"
+            print(f"\n{'='*60}")
+            print(f"[Gemini Judge] Sample {idx} | Score: {parsed_score:.2f} | {status}")
+            print(f"  Query: {query[:100]}{'...' if len(query) > 100 else ''}")
+            print(f"  Generated: {generated_answer[:100]}{'...' if len(generated_answer) > 100 else ''}")
+            print(f"  Reference: {reference_answer[:100]}{'...' if len(reference_answer) > 100 else ''}")
+            print(
+                f"  Gemini Response: {gemini_response[:200] if gemini_response else 'None'}"
+                f"{'...' if gemini_response and len(gemini_response) > 200 else ''}"
+            )
+            print(f"{'='*60}\n")
 
         # (legacy) JSONL 파일에 저장: unified 로깅 사용 시 중복되므로 기본 비활성화
         if not _UNIFIED_LOGGER.enabled:
@@ -1184,12 +1243,16 @@ class RMManager:
         )
         assert self._request_queue is not None, "Queue not initialized"
 
-        # [DEBUG] 제출되는 요청 상세 로깅
-        print(f"\n[DEBUG-RM] submit_prompt 호출됨: uid={uid}, indices={sample_indices}")
-        for i, data in enumerate(samples_data[:2]):  # 처음 2개만
-            print(f"  sample[{i}]: query={data.get('query', '')[:50]}...")
-            print(f"    generated_answer={data.get('generated_answer', 'MISSING')[:50] if data.get('generated_answer') else 'EMPTY'}...")
-            print(f"    reference_answer={data.get('reference_answer', '')[:50]}...")
+        # [DEBUG] 제출되는 요청 상세 로깅 (입/출력 노출 → verbose>=2에서만)
+        if getattr(self, "verbose_gemini_level", 0) >= 2:
+            print(f"\n[DEBUG-RM] submit_prompt 호출됨: uid={uid}, indices={sample_indices}")
+            for i, data in enumerate(samples_data[:2]):  # 처음 2개만
+                print(f"  sample[{i}]: query={data.get('query', '')[:50]}...")
+                print(
+                    "    generated_answer="
+                    f"{data.get('generated_answer', 'MISSING')[:50] if data.get('generated_answer') else 'EMPTY'}..."
+                )
+                print(f"    reference_answer={data.get('reference_answer', '')[:50]}...")
 
         self._request_queue.put(request)
 
@@ -1364,14 +1427,30 @@ class RMManager:
 
         async def evaluate_single(sample_data: Dict, local_idx: int):
             """단일 샘플 평가 (클로저로 semaphore 공유)"""
+            wait_t0 = time.perf_counter()
             async with semaphore:
+                wait_s = time.perf_counter() - wait_t0
+                try:
+                    self._gemini_semaphore_wait_s.observe(
+                        wait_s,
+                        ok=True,
+                        uid=str(request.uid),
+                        local_idx=int(local_idx),
+                    )
+                except Exception:
+                    pass
                 # LLM 입력 준비 (텍스트만, 이미지 없음)
                 prompt = self._prepare_llm_input(sample_data)
 
                 # [DEBUG] 입력 데이터 확인
                 gen_ans = sample_data.get('generated_answer', '')
                 ref_ans = sample_data.get('reference_answer', '')
-                print(f"[DEBUG-RM] idx={local_idx} | gen_ans={gen_ans[:50] if gen_ans else 'EMPTY'}... | ref_ans={ref_ans[:50] if ref_ans else 'EMPTY'}...")
+                if self.verbose_gemini_level >= 2:
+                    print(
+                        f"[DEBUG-RM] idx={local_idx} | "
+                        f"gen_ans={gen_ans[:50] if gen_ans else 'EMPTY'}... | "
+                        f"ref_ans={ref_ans[:50] if ref_ans else 'EMPTY'}..."
+                    )
                 if self.verbose_gemini_level >= 1:
                     print(f"[DEBUG-RM][GEMINI PROMPT idx={local_idx}] len={len(prompt)} chars")
                 if self.verbose_gemini_level >= 2:
@@ -1379,20 +1458,44 @@ class RMManager:
 
                 response_text = None
                 error_str = None
-                t0 = time.perf_counter()
+                total_t0 = time.perf_counter()
                 try:
                     # 텍스트만 전송 (이미지 없음)
+                    api_t0 = time.perf_counter()
                     response = await gemini_client.generate_content_async(prompt)
+                    api_s = time.perf_counter() - api_t0
+                    try:
+                        self._gemini_request_s.observe(
+                            api_s,
+                            ok=True,
+                            uid=str(request.uid),
+                            local_idx=int(local_idx),
+                        )
+                    except Exception:
+                        pass
                     response_text = response.text
                     judge_result = self._parse_llm_response(response_text)
-                    print(f"[DEBUG-RM] idx={local_idx} | Gemini 응답: score={judge_result.get('score', 'N/A')}")
+                    if self.verbose_gemini_level >= 1:
+                        print(f"[DEBUG-RM] idx={local_idx} | Gemini 응답: score={judge_result.get('score', 'N/A')}")
                     if self.verbose_gemini_level >= 2:
                         print(f"[DEBUG-RM][GEMINI RESPONSE RAW idx={local_idx}] raw={response_text}")
                 except Exception as e:
-                    print(f"[DEBUG-RM] idx={local_idx} | Gemini 오류: {e}")
+                    if self.verbose_gemini_level >= 1:
+                        print(f"[DEBUG-RM] idx={local_idx} | Gemini 오류: {e}")
                     error_str = str(e)
+                    try:
+                        api_s = time.perf_counter() - api_t0
+                        self._gemini_request_s.observe(
+                            api_s,
+                            ok=False,
+                            uid=str(request.uid),
+                            local_idx=int(local_idx),
+                            error=error_str,
+                        )
+                    except Exception:
+                        pass
                     judge_result = self._default_result(error_str)
-                latency_s = time.perf_counter() - t0
+                latency_s = time.perf_counter() - total_t0
 
                 # NDCG 계산
                 ndcg_value = ndcg(

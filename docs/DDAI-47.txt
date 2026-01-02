@@ -1,0 +1,181 @@
+# DDAI-47 초안 — 집중 강화학습(Focused RL) + 컴퓨트 커리큘럼(Thinking Budget) 설계
+
+## 1. 목적
+
+본 이슈는 DDAI-46에서 생성된 **Bucket 0(Edge-of-Competence) + Bucket A 일부**에 대해, 강화학습을 “아무데나” 쓰지 않고 **집중적으로** 적용해 **실제 성능 향상(일반화)**을 얻는 것이 목적이다.
+
+특히 본 이슈는 “hard 샘플 = 무조건 compute 폭증”이 아니라, **단계적 compute 커리큘럼**을 도입하여 비용-효율을 확보한다.
+
+---
+
+## 2. 배경 및 문제 정의
+
+* Edge-of-Competence 샘플은 “풀 수 있는데 잘 못 푸는” 구간이므로 RL 효율이 높다.
+* 그러나 이 구간은 곧바로 큰 탐색(rollouts, turns, temperature)을 걸면:
+
+  * 비용이 급증하고
+  * 불안정한 탐색(잡음)으로 reward hacking이나 길이 폭주가 생길 수 있다.
+* 따라서 **Small→Medium→Large**의 단계적 compute 스케줄을 설계하고,
+  **정체/실패**가 확인될 때만 다음 단계로 승격시키는 방식이 필요하다.
+
+
+## 3. 설계 (Design)
+
+### 3.1 입력
+
+* `bucket_A 일부 : 기존 DDAI - 46의 커리큘럼 러닝을 거치더라도 judge 평균값이 0.3 이하인 것들만 입력으로 사용
+* `bucket_0 필터링된 것 :  ground truth 가 문제 있거나 아니면 잘못된 형식 모두 제외. 정말로 어려운 것들만 입력으로 사용. 
+
+### 3.2 컴퓨트 커리큘럼(Compute Curriculum)
+
+Edge 버킷에 대해 아래 3단계를 적용한다.
+
+* **Stage S (Small)**
+
+  * rollouts k: 8~16
+  * max_turns: 7~9
+  * temperature: 0.7(또는 낮게)
+  * 목표: “값싼 탐색으로 풀리는 문제”를 먼저 수확
+
+* **Stage M (Medium)**
+
+  * k: 16~32
+  * max_turns: 9~11
+  * temperature: 0.9
+  * 목표: 경계 구간에서 golden trajectory 확보율 상승
+
+* **Stage L (Large)**
+
+  * k: 32+
+  * max_turns: 11~12
+  * temperature: 1.0
+  * 목표: 정말 어려운 edge 샘플을 끝까지 공략(비용은 크지만 대상은 적음)
+
+### 3.3 승격 규칙(Promotion Policy)
+
+샘플 또는 배치 단위로 다음 조건 중 하나가 만족되면 다음 stage로 승격한다.
+
+* 최근 N step 동안  judge_score가 개선되지 않음(정체 탐지)
+* 반대로 일정 임계치 달성 시에는 stage를 유지하거나 종료(조기 종료)
+
+---
+
+## 4. Golden Trajectory 자산화
+
+DDAI-47의 핵심 산출물은 “맞췄다”가 아니라, **어떻게 맞췄는지(trajectory)**이다.
+
+* `golden_traj/{uid}.json`
+
+  * 선택한 이미지/문서, 툴콜/액션, turn-by-turn 결과, judge 판정 근거
+* 활용:
+
+  1. 디버깅: 실패모드 재현 및 수정 근거
+  2. 데이터: 후속 SFT/MT용 고품질 샘플
+  3. 논문: “집중 RL이 어떻게 성능을 만들었는지” 정성 분석 근거
+
+-----
+
+  DDAI-47 수정 설계안 — 집중 강화학습(Focused RL) 파이프라인
+
+  1. 목적 및 전략 수정
+   * 목적: "돈(Compute)을 써서라도 Hard Problem의 정답 경로(Golden
+     Trajectory)를 뚫어낸다."
+   * 전략 변경: 실시간 승격(Online Promotion)은 복잡하고 불안정하므로,
+     Iterative Batch Filtering 방식으로 간소화한다.
+       * Round 1 (Probing): 전체 후보군에 대해 가볍게 찔러본다. (성공하면
+         수확, 실패하면 분류)
+       * Round 2 (Deep Dive): "될성부른 떡잎(잠재력 보유군)"만 골라 집중
+         타격한다.
+       * Round 3 (Last Resort): (선택적) 최후의 난제 도전.
+
+  ---
+
+  2. 입력 데이터 필터링 파이프라인 (The Funnel)
+
+  2.1 소스 데이터
+   1. Bucket A Tail (Hard A): DDAI-46 학습 후
+      로그(gspo_gemini_output.jsonl)에서 judge_score < 0.3 인 샘플들. (기존
+      커리큘럼으로도 해결 안 된 녀석들)
+   2. Bucket 0 (Unsolvable): data/curriculum_bucket_0.parquet.
+
+  2.2 전처리 필터링 (Preprocessing)
+  Bucket 0는 "Bad Data"일 확률이 높으므로, Rule-based Sanity Check를 먼저
+  수행한다.
+   * GT 검증: reference_answer가 비어있거나, 의미 없는 문자열인 경우 제거.
+   * 포맷 검증: question이 너무 짧거나(노이즈), 이미지 경로가 깨진 경우 제거.
+   * 구현: scripts/preprocess_focused_rl.py
+
+  ---
+
+  3. 컴퓨트 커리큘럼 상세 설계 (Iterative Execution)
+
+  각 Round는 별도의 학습 스크립트 실행(gspo_phase2_focused_*.sh)으로 구성된다.
+
+  Round 1: Probing (정찰 및 분류)
+   * 입력: 전처리된 Hard A + Bucket 0
+   * 설정:
+       * n_agent: 8 (최소한의 다양성 확보)
+       * max_turns: 7 (기본)
+       * temperature: 0.7 (안정적 탐색)
+   * 실행 후 분류 (Post-process):
+       * Success (S): Judge > 0.9 $\to$ Golden Trajectory 저장 (졸업)
+       * Potential (P): 0.1 <= NDCG <= 0.8 (검색은 좀 했는데 답을 못 냄) OR
+         0.1 <= Judge <= 0.8 (답이 아깝게 틀림) $\to$ Round 2 진출
+       * Fail (F): NDCG < 0.1 AND Judge < 0.1 $\to$ Drop (가망 없음/Bad Data)
+
+  Round 2: Deep Reasoning (집중 공략)
+   * 입력: Round 1의 Potential (P) 그룹
+   * 설정:
+       * n_agent: 32 (물량 투입, 다양한 경로 탐색)
+       * max_turns: 12 (Thinking Budget 2배 증액, 복잡한 추론 허용)
+       * temperature: 1.0 (창의적/이질적 시도 권장)
+   * 실행 후 처리:
+       * Success: Golden Trajectory 저장
+       * Fail: 리소스 한계로 포기 (Hard Negative로 분류하여 추후 분석)
+
+  ---
+
+  4. 구현 계획 (Action Items)
+
+  4.1 스크립트 구조화
+  하나의 거대한 스크립트 대신, 단계별로 명확히 분리한다.
+
+   1. `scripts/prepare_focused_input.py`:
+       * DDAI-46 로그(gspo_gemini_output.jsonl) 분석하여 Hard A 추출.
+       * Bucket 0 로드 및 Sanity Check.
+       * 합쳐서 data/focused_round1.parquet 생성.
+
+   2. `gspo_phase2_focused_round1.sh`:
+       * n_agent=8, max_turns=7 설정으로 실행.
+       * Golden Trajectory 자동 수집 모드 활성화.
+
+   3. `scripts/filter_round2.py`:
+       * Round 1 로그 분석.
+       * Success $\to$ golden_traj/ 저장.
+       * Potential $\to$ data/focused_round2.parquet 생성.
+
+   4. `gspo_phase2_focused_round2.sh`:
+       * n_agent=32, max_turns=12 설정으로 실행.
+
+  4.2 Golden Trajectory 저장 (Code Level)
+  rm_phase2.py 내에 수집 로직을 내장한다.
+   * 조건: judge_score > 0.9 (거의 정답)
+   * 저장 내용:
+       * uid, question, gt
+       * response_str (모델의 전체 사고 과정 및 툴 사용 내역)
+       * retrieved_images (실제 사용한 근거)
+   * 경로: data/golden_trajectories/{uid}.json
+
+  ---
+
+  5. 예상 결과물
+   1. High-Quality SFT Dataset: Round 1, 2를 뚫고 나온 "어려운 문제의 정답
+      풀이" 모음집. (단순 SFT 데이터보다 훨씬 가치 높음)
+   2. Failure Analysis Report: 끝까지 안 풀린 문제들의 유형 분석 (데이터
+      오류인지, 모델 한계인지).
+
+-----
+
+좋아. 이제 기존에 세웠던 이 부분도 이제 코드 / 실제에 맞게 좀 더 치밀하게 다듬어 보자.
+
+이제 DDAI - 47인 집중 강화학습이야. 이 부분에 대해서도, 먼저 코드 수정전에 브레인스토밍부터 해 보자.

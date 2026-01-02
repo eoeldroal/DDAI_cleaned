@@ -811,6 +811,14 @@ class RayPPOTrainer(object):
         all_scores = []
         all_ndcg = []
         all_vlm_scores = []
+        prompt_idxs_with_scores = set()
+
+        # prompt 단위 통계를 위해 n_agent를 추출 (best-effort)
+        n_agent = None
+        try:
+            n_agent = int(self.config.actor_rollout_ref.rollout.n_agent)
+        except Exception:
+            n_agent = None
 
         for uid, result in reward_results.items():
             for i, sample_idx in enumerate(result.sample_indices):
@@ -835,15 +843,35 @@ class RayPPOTrainer(object):
                     vlm_score = vlm_result.get('judge_score', 0.0)
                     all_vlm_scores.append(vlm_score)
 
+                if n_agent and n_agent > 0:
+                    try:
+                        prompt_idxs_with_scores.add(int(sample_idx) // n_agent)
+                    except Exception:
+                        pass
+
         # 메트릭 계산
         def safe_mean(lst):
             return sum(lst) / len(lst) if lst else 0.0
+
+        samples_scored = len(all_scores)
+        sample_coverage = float(samples_scored) / float(batch_size) if batch_size else 0.0
+        prompts_total = (batch_size // n_agent) if (n_agent and n_agent > 0 and batch_size % n_agent == 0) else None
+        prompts_with_scores = len(prompt_idxs_with_scores)
+        prompt_coverage = (
+            float(prompts_with_scores) / float(prompts_total)
+            if prompts_total is not None and prompts_total > 0
+            else 0.0
+        )
 
         metrics = {
             'reward/streaming_final_score_mean': safe_mean(all_scores),
             'reward/streaming_ndcg_mean': safe_mean(all_ndcg),
             'reward/streaming_vlm_score_mean': safe_mean(all_vlm_scores),
             'reward/streaming_prompts_processed': len(reward_results),
+            'reward/streaming_samples_scored': samples_scored,
+            'reward/streaming_sample_coverage': sample_coverage,
+            'reward/streaming_prompts_with_scores': prompts_with_scores,
+            'reward/streaming_prompt_coverage': prompt_coverage,
         }
 
         print(f"[RayPPOTrainer] 스트리밍 Reward 변환 완료: "

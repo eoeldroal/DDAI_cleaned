@@ -24,24 +24,42 @@ fi
 echo ">>> OpenAI API Key 확인 완료"
 
 export PYTHONNOUSERSITE=1
-export PYTHONASYNCIODEBUG=1  
+export PYTHONASYNCIODEBUG=0
 
 # export PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync,max_split_size_mb:256 -> RuntimeError: cudaMallocAsync does not yet support shareIpcHandle. If you need it, please file an issue describing your use case.
 
-export GEMINI_DEBUG_VERBOSE=2
-export FROZEN_DEBUG_VERBOSE=2
+export GEMINI_DEBUG_VERBOSE=0
+export FROZEN_DEBUG_VERBOSE=0
 export NDCG_DEBUG=1  # <--- 추가됨
 export NDCG_DEBUG_PATH=./logs/ndcg_debug.jsonl
+# API 입/출력(detail) 로그: unified log에만 남기고 콘솔 출력은 끈다
 export FLASH_RM_LOG=1
+export GEMINI_DETAIL_LOG=1
+export FROZEN_DETAIL_LOG=1
+# 콘솔에는 출력하지 않고, unified log에만 남긴다
+export GEMINI_DETAIL_CONSOLE=0
+export FROZEN_DETAIL_CONSOLE=0
 export NDCG_DEBUG_LOG_ALL=1
 export SEARCH_DEBUG=1
 export VERL_PPO_LOGGING_LEVEL=DEBUG
 
 # =============================================================================
+# API latency stats logging (Gemini / Frozen(OpenAI-compatible))
+# =============================================================================
+# - Summary stats are emitted to unified JSONL and (optionally) console.
+# - Per-call events can be enabled if you need raw distributions.
+export API_LATENCY_ENABLE=1
+export API_LATENCY_CONSOLE=1
+export API_LATENCY_PER_CALL=0
+export API_LATENCY_SUMMARY_EVERY_N=200
+export API_LATENCY_SUMMARY_EVERY_S=30
+export API_LATENCY_SAMPLE_SIZE=5000
+
+# =============================================================================
 # Unified trajectory logging (single JSONL)
 # =============================================================================
 export UNIFIED_LOG_ENABLE=1
-export UNIFIED_LOG_PATH=./logs/focused2/unified_trajectory.jsonl
+export UNIFIED_LOG_PATH=./logs/focused3/unified_trajectory.jsonl
 export UNIFIED_LOG_CLIENT_BATCH_SIZE=200
 export UNIFIED_LOG_CLIENT_FLUSH_INTERVAL_S=1.0
 export UNIFIED_LOG_WRITER_FLUSH_EVERY_N=2000
@@ -133,7 +151,7 @@ if [ $# -ge 1 ] && [[ "$1" != *=* ]]; then
 fi
 
 # 모델 경로
-model_path=./checkpoints/gspo_phase2_gemini_flash_curriculum_focused_round_1/merged_model
+model_path=./checkpoints/sft_qwen2_5_sft_7b_after_focus/global_step_64
 
 # GPU 설정
 n_gpus=8
@@ -142,7 +160,7 @@ n_gpus=8
 # - train_batch_size: 원본 프롬프트 수
 # - n_agent: 프롬프트당 생성할 응답 수
 # - 실제 배치 크기 = train_batch_size × n_agent
-train_batch_size=8
+train_batch_size=16
 ppo_mini_batch_size=8
 ppo_micro_batch_size_per_gpu=1
 log_prob_micro_batch_size_per_gpu=1
@@ -157,7 +175,7 @@ max_turns=15
 # 4. Gemini VLM Judge 설정
 # =============================================================================
 # 로그 경로 (JSONL 형식)
-log_path="./logs/focused2/gspo_gemini_output.jsonl"
+log_path="./logs/focused3/gspo_gemini_output.jsonl"
 
 # 이미지 기본 경로 (검색된 이미지 및 정답 이미지)
 image_base_path="./data/images"
@@ -166,7 +184,7 @@ image_base_path="./data/images"
 gemini_model="gemini-3-flash-preview"
 
 # 동시 API 요청 수 (rate limit 대응)
-max_concurrent_requests=64
+max_concurrent_requests=512
 
 # 스트리밍 Reward 모드 (프롬프트 완료 시 즉시 Reward 계산 시작)
 # - True: Generation과 Reward를 파이프라인으로 병렬 처리 (약 13% 성능 향상)
@@ -179,14 +197,14 @@ streaming_reward_timeout=90
 # =============================================================================
 # [Phase 5] OpenAI 호환 비동기 API 사용으로 ~10x 성능 향상
 # - 동시 API 요청 수 (rate limit 대응, 기본값: 50)
-frozen_max_concurrent=64
+frozen_max_concurrent=512
 
 # Frozen Generator 모델명 (DashScope에서 제공하는 모델)
 # frozen_model="qwen2.5-vl-72b-instruct"
 frozen_model="gpt-5-mini-2025-08-07"
 
 # 최대 토큰 수 (답변 길이)
-frozen_max_tokens=3072
+frozen_max_tokens=5120
 
 # 재시도 설정
 frozen_max_retries=8
@@ -202,7 +220,7 @@ search_url="http://163.239.28.21:5002/search"
 # =============================================================================
 # 6. 로그 디렉토리 생성
 # =============================================================================
-mkdir -p ./logs/focused2
+mkdir -p ./logs/focused3
 echo ">>> 로그 경로: $log_path"
 
 # =============================================================================
@@ -246,7 +264,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.1 \
     +actor_rollout_ref.actor.optim.name='AdamW' \
     actor_rollout_ref.model.use_remove_padding=False \
-    +actor_rollout_ref.model.enable_activation_offload=True \
+    +actor_rollout_ref.model.enable_activation_offload=False \
     actor_rollout_ref.actor.ppo_mini_batch_size=$ppo_mini_batch_size \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$ppo_micro_batch_size_per_gpu \
     actor_rollout_ref.actor.strategy="fsdp" \
@@ -259,8 +277,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.rollout.free_cache_engine=True \
-    actor_rollout_ref.actor.fsdp_config.param_offload=False \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    actor_rollout_ref.actor.fsdp_config.param_offload=True \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
     actor_rollout_ref.actor.state_masking=True \
     actor_rollout_ref.actor.use_torch_compile=False \
     +actor_rollout_ref.actor.fsdp_config.mixed_precision.reduce_dtype=bf16 \
@@ -295,10 +313,10 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger=['wandb','console'] \
     trainer.project_name=gspo_phase2_gemini \
-    trainer.experiment_name=gspo_phase2_gemini_flash_curriculum_focused_round_2 \
+    trainer.experiment_name=gspo_phase2_gemini_flash_curriculum_focused_round_3 \
     trainer.n_gpus_per_node=$n_gpus \
     trainer.nnodes=1 \
-    trainer.save_freq=30 \
+    trainer.save_freq=4 \
     trainer.test_freq=1000000 \
     trainer.total_epochs=1 \
     trainer.resume_mode=auto \

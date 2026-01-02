@@ -32,6 +32,7 @@ from datetime import datetime
 # ▲▲▲[성능 측정 추가]▲▲▲
 
 from verl.utils.unified_logger import get_unified_logger
+from verl.utils.api_latency import ApiLatencyConfig, ApiLatencyStats
 
 _UNIFIED_LOGGER = get_unified_logger()
 
@@ -62,6 +63,8 @@ _PHASE2_PERF_LOG_ENABLED = os.getenv("PHASE2_PERF_LOG", "0") == "1"
 # =============================================================================
 _FROZEN_GEN_LOG_PATH = os.path.join("./logs", "frozen_generator_detail.jsonl")
 os.makedirs(os.path.dirname(_FROZEN_GEN_LOG_PATH), exist_ok=True)
+_FROZEN_DETAIL_LOG_ENABLED = os.getenv("FROZEN_DETAIL_LOG", "0").lower() in ("1", "true", "t", "yes", "y")
+_FROZEN_DETAIL_CONSOLE_ENABLED = os.getenv("FROZEN_DETAIL_CONSOLE", "1").lower() in ("1", "true", "t", "yes", "y")
 
 def _log_frozen_generator_detail(
     idx: int,
@@ -76,6 +79,8 @@ def _log_frozen_generator_detail(
 
     입력 프롬프트와 출력 응답을 JSONL 파일과 콘솔에 기록합니다.
     """
+    if not _FROZEN_DETAIL_LOG_ENABLED:
+        return
     import datetime
 
     log_entry = {
@@ -100,13 +105,14 @@ def _log_frozen_generator_detail(
     )
 
     # 콘솔 출력 (간략 버전)
-    status = "SUCCESS" if status_code == 200 and not error else f"ERROR: {error or f'code={status_code}'}"
-    print(f"\n{'='*60}")
-    print(f"[Frozen Generator] Sample {idx} | Status: {status}")
-    print(f"  Question: {question[:100]}{'...' if len(question) > 100 else ''}")
-    print(f"  Images: {image_paths[:3]}{'...' if len(image_paths) > 3 else ''}")
-    print(f"  Answer: {answer[:200]}{'...' if len(answer) > 200 else ''}")
-    print(f"{'='*60}\n")
+    if _FROZEN_DETAIL_CONSOLE_ENABLED:
+        status = "SUCCESS" if status_code == 200 and not error else f"ERROR: {error or f'code={status_code}'}"
+        print(f"\n{'='*60}")
+        print(f"[Frozen Generator] Sample {idx} | Status: {status}")
+        print(f"  Question: {question[:100]}{'...' if len(question) > 100 else ''}")
+        print(f"  Images: {image_paths[:3]}{'...' if len(image_paths) > 3 else ''}")
+        print(f"  Answer: {answer[:200]}{'...' if len(answer) > 200 else ''}")
+        print(f"{'='*60}\n")
 
     # (legacy) JSONL 파일에 저장: unified 로깅 사용 시 중복되므로 기본 비활성화
     if not _UNIFIED_LOGGER.enabled:
@@ -371,7 +377,6 @@ def _to_image_part(path: str) -> dict | None:
 # - 기본: OPENAI_API_KEY(+OPENAI_BASE_URL/FROZEN_OPENAI_BASE_URL)
 # - 없으면 DashScope 호환 키/베이스로 폴백
 # =============================================================================
-_OPENAI_ASYNC_CLIENT = None
 _HAS_OPENAI_ASYNC = False
 
 try:
@@ -390,18 +395,74 @@ try:
     _SELECTED_BASE_URL = _PRIMARY_BASE_URL or _FALLBACK_BASE_URL
 
     if _SELECTED_API_KEY:
-        _OPENAI_ASYNC_CLIENT = AsyncOpenAI(
-            api_key=_SELECTED_API_KEY,
-            base_url=_SELECTED_BASE_URL,
-            timeout=60.0,
-            max_retries=0,  # 우리가 직접 재시도 로직 관리
-        )
         _HAS_OPENAI_ASYNC = True
-        _phase2_logger.info(f"[Phase5] OpenAI AsyncClient initialized: {_SELECTED_BASE_URL}")
 except ImportError:
     _phase2_logger.warning("[Phase5] OpenAI SDK not installed. Falling back to DashScope SDK.")
 except Exception as e:
     _phase2_logger.warning(f"[Phase5] Failed to initialize OpenAI AsyncClient: {e}")
+
+# Per-thread/per-loop client: AsyncOpenAI is not thread-safe across event loops.
+def _make_openai_async_client() -> "AsyncOpenAI":
+    if not _HAS_OPENAI_ASYNC:
+        raise RuntimeError("OpenAI Async SDK not available")
+    if not _SELECTED_API_KEY:
+        raise RuntimeError("No OpenAI-compatible API key configured")
+    return AsyncOpenAI(
+        api_key=_SELECTED_API_KEY,
+        base_url=_SELECTED_BASE_URL,
+        timeout=60.0,
+        max_retries=0,  # 우리가 직접 재시도 로직 관리
+    )
+
+
+async def _maybe_close_openai_client(client: object) -> None:
+    """
+    Best-effort cleanup.
+    OpenAI SDK versions differ in whether `close()` is sync/async.
+    """
+    try:
+        close_fn = getattr(client, "close", None)
+        if close_fn is None:
+            return
+        out = close_fn()
+        if asyncio.iscoroutine(out):
+            await out
+    except Exception:
+        return
+
+# =============================================================================
+# API latency stats (Frozen Generator / OpenAI-compatible)
+# =============================================================================
+_FROZEN_LATENCY_CFG = ApiLatencyConfig.from_env(prefix="FROZEN")
+try:
+    _FROZEN_OPENAI_BASE_URL = str(_SELECTED_BASE_URL)  # type: ignore[name-defined]
+except Exception:
+    _FROZEN_OPENAI_BASE_URL = None
+
+_FROZEN_OPENAI_SEMAPHORE_WAIT_S = ApiLatencyStats(
+    name="frozen.openai.semaphore_wait",
+    event_prefix="api.frozen.semaphore_wait",
+    cfg=_FROZEN_LATENCY_CFG,
+    logger=_UNIFIED_LOGGER,
+    static_fields={"base_url": _FROZEN_OPENAI_BASE_URL},
+    meta_keys=("model", "n_images"),
+)
+_FROZEN_OPENAI_REQUEST_S = ApiLatencyStats(
+    name="openai.responses.create",
+    event_prefix="api.frozen.request",
+    cfg=_FROZEN_LATENCY_CFG,
+    logger=_UNIFIED_LOGGER,
+    static_fields={"base_url": _FROZEN_OPENAI_BASE_URL},
+    meta_keys=("model", "reasoning_effort", "max_output_tokens", "n_images"),
+)
+_FROZEN_IMAGE_ENCODE_S = ApiLatencyStats(
+    name="frozen.image_base64_encode",
+    event_prefix="api.frozen.encode",
+    cfg=_FROZEN_LATENCY_CFG,
+    logger=_UNIFIED_LOGGER,
+    static_fields={"base_url": _FROZEN_OPENAI_BASE_URL},
+    meta_keys=("model", "n_images"),
+)
 
 
 def _image_to_base64_url(path: str) -> str | None:
@@ -453,7 +514,18 @@ async def _call_frozen_generator_async_single(
         (status_code, answer_text) 튜플
     """
     if semaphore:
+        wait_t0 = _time.perf_counter()
         async with semaphore:
+            wait_s = _time.perf_counter() - wait_t0
+            try:
+                _FROZEN_OPENAI_SEMAPHORE_WAIT_S.observe(
+                    wait_s,
+                    ok=True,
+                    model=str(model),
+                    n_images=int(len(image_paths or [])),
+                )
+            except Exception:
+                pass
             return await _call_frozen_generator_async_single_impl(
                 client, model, question, image_paths, max_tokens
             )
@@ -481,9 +553,12 @@ async def _call_frozen_generator_async_single_impl(
         )
 
         # Responses API 형식으로 입력 구성
+        # - system/developer message → `instructions`
+        # - user message → `input` items
         user_content = []
 
         # 이미지를 base64로 인코딩하여 추가
+        enc_t0 = _time.perf_counter()
         for p in (image_paths or []):
             base64_url = _image_to_base64_url(p)
             if base64_url:
@@ -491,6 +566,16 @@ async def _call_frozen_generator_async_single_impl(
                     "type": "input_image",
                     "image_url": base64_url,
                 })
+        enc_s = _time.perf_counter() - enc_t0
+        try:
+            _FROZEN_IMAGE_ENCODE_S.observe(
+                enc_s,
+                ok=True,
+                model=str(model),
+                n_images=int(len(image_paths or [])),
+            )
+        except Exception:
+            pass
 
         # 텍스트 질문 추가
         user_content.append({
@@ -498,22 +583,50 @@ async def _call_frozen_generator_async_single_impl(
             "text": f"Question: {qtext}"
         })
 
-        inputs = [
-            {"role": "developer", "content": sys_prompt},
-            {"role": "user", "content": user_content},
-        ]
+        input_items = [{"role": "user", "content": user_content}]
 
         # 환경 변수에서 reasoning effort 로드 (기본값: minimal)
         # options: minimal, low, medium, high (depending on model support)
         reasoning_effort = os.getenv("FROZEN_REASONING_EFFORT", "minimal")
 
         # 비동기 API 호출
-        response = await client.responses.create(
-            model=model,
-            input=inputs,
-            reasoning={"effort": reasoning_effort},
-            max_output_tokens=max_tokens,
-        )
+        req_t0 = _time.perf_counter()
+        try:
+            response = await client.responses.create(
+                model=model,
+                instructions=sys_prompt,
+                input=input_items,
+                reasoning={"effort": reasoning_effort},
+                max_output_tokens=max_tokens,
+                store=False,
+            )
+            req_s = _time.perf_counter() - req_t0
+            try:
+                _FROZEN_OPENAI_REQUEST_S.observe(
+                    req_s,
+                    ok=True,
+                    model=str(model),
+                    reasoning_effort=str(reasoning_effort),
+                    max_output_tokens=int(max_tokens),
+                    n_images=int(len(image_paths or [])),
+                )
+            except Exception:
+                pass
+        except Exception as e:
+            req_s = _time.perf_counter() - req_t0
+            try:
+                _FROZEN_OPENAI_REQUEST_S.observe(
+                    req_s,
+                    ok=False,
+                    model=str(model),
+                    reasoning_effort=str(reasoning_effort),
+                    max_output_tokens=int(max_tokens),
+                    n_images=int(len(image_paths or [])),
+                    error=str(e),
+                )
+            except Exception:
+                pass
+            raise
 
         # 응답 추출
         answer = getattr(response, "output_text", None)
@@ -551,16 +664,34 @@ async def _call_frozen_generator_async_single_impl(
 # - maxsize=64: 배치 크기 고려한 캐시 크기 (메모리 vs 성능 트레이드오프)
 # =============================================================================
 from functools import lru_cache
+from io import BytesIO
 
-@lru_cache(maxsize=64)
+@lru_cache(maxsize=128)
+def _cached_image_bytes(path: str) -> bytes:
+    """
+    Thread-safe image cache.
+
+    NOTE:
+    - Caching PIL Image objects across threads can be fragile because the underlying
+      file handle / decoder state may be shared and not thread-safe.
+    - Cache raw bytes instead, then create a fresh Image object per call.
+    """
+    with open(path, "rb") as f:
+        return f.read()
+
+
 def _cached_image_open(path: str) -> 'Image.Image':
     """
-    캐시된 이미지 로딩 함수
-
-    동일 경로에 대한 반복 호출 시 캐시에서 반환합니다.
-    주의: 반환된 이미지는 원본이므로 수정 시 .copy() 필요
+    Load an image from cached bytes and return a fresh, fully-loaded PIL Image.
+    This avoids cross-thread sharing of a single PIL Image instance.
     """
-    return Image.open(path)
+    img = Image.open(BytesIO(_cached_image_bytes(path)))
+    img.load()  # fully decode; detach from file-like object state
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    else:
+        img = img.copy()
+    return img
 
 
 def process_image(image, max_pixels: int = 2048 * 2048, min_pixels: int = 512 * 512):
@@ -1175,6 +1306,13 @@ class LLMGenerationManager:
         # CPU: Calculate Crop
         crop_area = [int(raw_width * obs_item[0] / width), int(raw_height * obs_item[1] / height), int(raw_width * obs_item[2] / width), int(raw_height * obs_item[3] / height)]
         crop_area = [max(0, crop_area[0]), max(0, crop_area[1]), min(raw_width, crop_area[2]), min(raw_height, crop_area[3])]
+
+        # [Safety] Reject degenerate crops early (can happen after clamping/rounding).
+        if crop_area[2] <= crop_area[0] or crop_area[3] <= crop_area[1]:
+            raise ValueError(
+                f"Invalid bbox crop (degenerate area): "
+                f"obs_item={obs_item} size={width}x{height} raw={raw_width}x{raw_height} crop_area={crop_area}"
+            )
         
         # CPU: Perform Crop
         try:
@@ -1973,6 +2111,78 @@ class LLMGenerationManager:
                 ans = index2answer.get(i, "")
                 self.generated_answers[i] = ans
 
+        # =========================================================================
+        # [Phase 6] Partial submit: 일부 샘플만 search_complete인 프롬프트도 평가
+        #
+        # 기존 Phase 6 스트리밍은 "프롬프트(=n_agent 묶음) 전원 search_complete"일 때만
+        # Frozen Generator + RM 제출을 수행해서, n_agent 중 1개만 실패해도 나머지 샘플이
+        # 전부 0 reward(미평가)로 남는 문제가 있었다.
+        #
+        # 정책:
+        # - 파싱 성공 + `<search_complete>true</search_complete>`인 샘플만 평가 대상
+        # - 나머지는 RM/FG 호출 없이 0 reward 유지
+        #
+        # 구현:
+        # - 전원 search_complete 프롬프트는 기존 경로에서 이미 submitted=True로 처리됨.
+        # - submitted=False인 프롬프트에 대해, search_completed=True인 샘플만 모아
+        #   프롬프트당 1회 submit_prompt(...)를 수행한다.
+        # =========================================================================
+        if self.streaming_reward_manager and getattr(self, "_prompt_completion_status", None):
+            try:
+                prompt_ids = list(self._prompt_completion_status.keys())
+                n_agent = int(getattr(self.config, "n_agent", 1))
+                submitted_prompts = 0
+                submitted_samples = 0
+
+                for prompt_idx, prompt_id in enumerate(prompt_ids):
+                    status = self._prompt_completion_status.get(prompt_id) or {}
+                    if status.get("submitted", False):
+                        continue
+
+                    group_indices = status.get("sample_indices") or []
+                    to_eval = [
+                        i for i in group_indices
+                        if 0 <= i < len(self.search_completed) and self.search_completed[i]
+                    ]
+                    if not to_eval:
+                        continue
+
+                    # Frozen generator 답변이 준비된 샘플만 RM에 제출한다.
+                    # (completed_indices는 streaming에서 처리되지 않은 search_complete 샘플이므로,
+                    #  위 Frozen generator batch 호출 이후 generated_answers가 채워져야 한다.)
+                    samples_data = self._collect_samples_data(to_eval)
+
+                    self.streaming_reward_manager.submit_prompt(
+                        uid=str(prompt_id),
+                        sample_indices=list(to_eval),
+                        samples_data=samples_data,
+                    )
+                    status["submitted"] = True
+                    self._prompt_completion_status[prompt_id] = status
+
+                    submitted_prompts += 1
+                    submitted_samples += len(to_eval)
+
+                    try:
+                        _UNIFIED_LOGGER.log(
+                            "rm.streaming.partial_submit",
+                            uid=str(prompt_id),
+                            prompt_idx=int(prompt_idx),
+                            n_agent=int(n_agent),
+                            n_scored=int(len(to_eval)),
+                            sample_indices=list(map(int, to_eval)),
+                        )
+                    except Exception:
+                        pass
+
+                if submitted_prompts > 0:
+                    print(
+                        f"[Phase 6] Partial submit 완료: prompts={submitted_prompts}, "
+                        f"samples={submitted_samples} (실패 샘플은 0 reward 유지)"
+                    )
+            except Exception as e:
+                print(f"[Phase 6] Partial submit 실패(무시하고 진행): {e}")
+
         # [Phase 6] 모든 완료된 샘플의 답변 적용 (스트리밍 + 배치 모두 포함)
         for i, flag in enumerate(self.search_completed):
             if flag:
@@ -2469,7 +2679,8 @@ class LLMGenerationManager:
 
     def _call_frozen_generator_single(self, question: str, image_paths: List[str]) -> Tuple[int, str]:
         if not _HAS_DASHSCOPE:
-            print("🚨 오류: DashScope 설정이 누락되었습니다. (.env 키 확인 또는 라이브러리 설치 필요)") # 디버깅
+            if getattr(self, "verbose_frozen", 0) >= 1:
+                print("🚨 오류: DashScope 설정이 누락되었습니다. (.env 키 확인 또는 라이브러리 설치 필요)") # 디버깅
             return (0, "")
 
         try:
@@ -2503,7 +2714,8 @@ class LLMGenerationManager:
                     max_tokens=int(getattr(self.config, "frozen_max_tokens", 256)),
                 )
             except Exception as e:
-                print(f"🚨 [API ERROR] Question: {question[:30]}... | Error: {e}")  # 디버깅
+                if getattr(self, "verbose_frozen", 0) >= 1:
+                    print(f"🚨 [API ERROR] Question: {question[:30]}... | Error: {e}")  # 디버깅
                 return (0, "")
 
             code = getattr(resp, "status_code", None)
@@ -2513,7 +2725,8 @@ class LLMGenerationManager:
             
             return (int(code) if isinstance(code, HTTPStatus) else (code or 0), "")
         except Exception as e:
-            print(f"🚨 오류: API 호출 중 에러 발생: {e}") # 디버깅
+            if getattr(self, "verbose_frozen", 0) >= 1:
+                print(f"🚨 오류: API 호출 중 에러 발생: {e}") # 디버깅
             return (0, "")
 
 
@@ -2534,7 +2747,7 @@ class LLMGenerationManager:
             return results
 
         # [Phase 5] OpenAI AsyncClient 사용 가능시 비동기 처리
-        if _HAS_OPENAI_ASYNC and _OPENAI_ASYNC_CLIENT is not None:
+        if _HAS_OPENAI_ASYNC and _SELECTED_API_KEY:
             return self._call_frozen_generator_batch_async_wrapper(
                 indices, questions, images_list
             )
@@ -2701,6 +2914,8 @@ class LLMGenerationManager:
         results: Dict[int, str] = {}
         if not indices:
             return results
+        if not _HAS_OPENAI_ASYNC or not _SELECTED_API_KEY:
+            return results
 
         # 설정값 가져오기
         max_concurrent = int(getattr(self.config, "frozen_max_concurrent", 50))
@@ -2719,6 +2934,7 @@ class LLMGenerationManager:
         )
 
         total_timeout = float(getattr(self.config, "frozen_total_timeout", 60.0))
+        client = _make_openai_async_client()
 
         async def _single_with_retry(idx: int, q: str, paths: List[str]) -> Tuple[int, str]:
             """재시도 로직이 포함된 단일 비동기 호출"""
@@ -2733,10 +2949,10 @@ class LLMGenerationManager:
                 if self.verbose_frozen >= 1:
                     q_snippet = (q[:160] + ("..." if len(q) > 160 else ""))
                     print(f"[FROZEN][REQUEST idx={idx} attempt={attempt+1}] q={q_snippet} | images={len(paths)}")
-                    if self.verbose_frozen >= 2:
-                        print(f"[FROZEN][REQUEST FULL idx={idx}] question={q}\n  images={paths}")
+                if self.verbose_frozen >= 2:
+                    print(f"[FROZEN][REQUEST FULL idx={idx}] question={q}\n  images={paths}")
                 code, ans = await _call_frozen_generator_async_single(
-                    client=_OPENAI_ASYNC_CLIENT,
+                    client=client,
                     model=model,
                     question=q,
                     image_paths=paths,
@@ -2820,6 +3036,7 @@ class LLMGenerationManager:
             f"elapsed={elapsed:.2f}s, "
             f"throughput={len(indices)/elapsed:.1f} req/s"
         )
+        await _maybe_close_openai_client(client)
 
         return results
 
@@ -2831,7 +3048,15 @@ class LLMGenerationManager:
         프롬프트별 완료 추적 초기화
 
         n_agent 구조에서 각 프롬프트의 샘플들을 그룹화하여 추적합니다.
-        프롬프트의 모든 샘플이 완료되면 Reward 계산을 시작합니다.
+        프롬프트의 모든 샘플이 `<search_complete>true</search_complete>`로 완료되면
+        (기존 Phase 6 동작) 해당 프롬프트를 즉시 스트리밍 Reward로 제출합니다.
+
+        NOTE:
+        - `gen_batch`는 `ray_trainer.py`에서 pop 시 `uid`를 유지하지 않는 경우가 많아,
+          기본적으로 `id`를 prompt_id로 사용합니다.
+        - 일부 샘플만 `search_complete`를 찍은 경우에는 여기서 즉시 제출되지 않으며,
+          `run_llm_loop()` 종료 시점에 "partial submit" 경로에서 성공 샘플만 모아
+          프롬프트당 1회 제출합니다(실패 샘플은 0 reward 유지).
         """
         uids = gen_batch.non_tensor_batch.get('uid', gen_batch.non_tensor_batch.get('id', []))
         n_agent = self.config.n_agent

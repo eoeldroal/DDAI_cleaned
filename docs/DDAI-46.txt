@@ -1,0 +1,156 @@
+# DDAI-46 초안 — 커리큘럼 러닝 엔진 (LLM/VLM용) 설계 & 구현
+
+## 1. 목적
+
+본 이슈의 목적은 **GSPO Phase 2 학습에서 ‘무엇을 얼마나 학습할지’를 자동으로 결정하는 커리큘럼**을 구축하는 것이다. 
+
+---
+
+## 2. 배경 및 문제 정의
+
+GSPO Phase 2에서 단순 균등 샘플링을 사용할 경우 아래 문제가 발생한다.
+
+* **Too-easy 샘플**(이미 pass@1이 높음)은 학습 대비 효용이 낮고, RL의 “일반화” 이득이 제한적이다.
+* **Too-hard 샘플**(pass@k≈0)은 보상이 희박해 학습 신호가 약하고, 높은 탐색 비용이 요구된다.
+* 실제로 RL이 성능을 크게 끌어올리는 구간은 **“한 번엔 실패하지만 여러 번 시도하면 성공 가능한” solvabi
+lity gap**에 해당한다
+* 또한 이 phase 2는 flash 3 reward model , gpt 5 mini frozen generator 등 여러 외부 api를 거쳐야 하는, 시간적으로 비효율적인 작업에 속해 데이터셋의 절대적인 수를 줄이는 것이 핵심이다. 
+
+따라서 본 이슈에서는 난이도를 기존 gspo phase 1의 기록을 바탕으로 정의한다. 
+
+---
+
+## 3. 핵심 개념 및 정의 (Definitions)
+
+### 3.1 성공률 지표
+
+* **ndcg_score**: retrieval 성능(Phase 2에서 보조 신호)
+
+### 3.2 커리큘럼 버킷(난이도 구간) 정의
+
+모든 샘플(uid)은 주기적으로 아래 버킷 중 하나로 분류된다.
+
+* **Bucket B (Mastered)**
+
+  * ndcg 점수가 각 샘플별 n_agent 별로 각각 충분히 높음
+  * 의미: 현재 모델이 이미 잘 푸는 문제
+  * 처리: 학습에서 제외
+
+* **Bucket A (Edge-of-Competence / Solvability Gap)** ← 핵심 학습 대상
+
+  * ndcg 점수가 높은 agent 결과도 존재하고 낮은 agent 결과도 존재. 평균적으로 0.1~0.7 구간
+  * 의미: “한 번에 못 맞추지만 시도하면 맞출 수 있는” 경계 난이도
+  * 처리: 커리큘럼의 중심. DDAI-47의 집중 RL 대상으로 전달
+
+* **Bucket 0 (Unsolvable-for-now / Outlier)**
+
+  * ndcg 점수가 agent 각각 낮은 경향을 보이고, 평균값이 0~0.1에 속함. 
+  * 의미: 현재 모델/설정에서 학습 신호가 거의 없는 구간
+  * 처리: RL에서 제외. 데이터 품질/정답 정의/환경(툴·입력) 문제를 점검하는 별도 트랙으로 분리
+
+> 임계치(θ)는 초기엔 경험적으로 설정하고, ablation으로 조정한다.
+> (예: θ_easy=0.7, θ1=0.1 같은 형태)
+
+### 3.3 참조 파일
+ * ./logs/gspo_phase1.json
+
+---
+
+## 4. 설계 (Design)
+
+### 4.1 파이프라인 개요
+
+1. **Check** : 기존 실행 기록을 확인하여 ndcg 점수 확인
+2. **Bucketing**: 위 정의에 따라 A/B/0 버킷 분류
+3. **Sampling Policy 생성**: 다음 학습에서 사용할 샘플링 분포(버킷별 비율 + 버킷 내부 우선순위) 결정
+
+### 4.2 난이도별 커리큘럼
+
+1. Bucket A에서만 데이터셋 구성
+2. 이 Bucket A에서, ndcg 점수가 높은 순서 -> 낮은 순서대로 순서 구성
+3. 이를 바탕으로 커리큘럼 학습 수행.
+
+### 4.3 데이터셋/스크립트 위치 
+
+* ./data/curriculum_bucket_0/a/b로 현재 데이터셋 구별 및 정리 완료
+* 추가적으로, 난이도별로 정렬을 완료해 둔 상태. 
+* suffle 설정을 false로 해 두었고, 난이도별 정렬을 한 데이터셋을 그대로 사용하여, gspo_phase2_gemini_flash.sh 파일로 훈련 실행.
+
+-----
+
+DDAI-46 구현 보고서 — 커리큘럼 러닝 엔진 (LLM/VLM용)
+
+  1. 목적
+  GSPO Phase 2 학습의 효율성 극대화를 위해, 기존 학습 기록을 기반으로 '학습할 가치가 있는
+  데이터(Bucket A)'를 선별하고, 이를 '쉬운 것부터 어려운 순서(Easy-to-Hard)'로 정렬하여 공급하는
+  자동화된 커리큘럼 파이프라인을 구축한다.
+
+  2. 배경 및 문제 정의
+   * 고비용 환경: Phase 2는 Gemini 3 Flash(Judge), GPT-5-mini(Frozen Generator) 등 외부 API
+     의존도가 높아 샘플당 학습 비용/시간이 크므로 데이터 효율이 핵심이다.
+   * 학습 효율성:
+       * Too-easy (Bucket B): 이미 마스터한 문제로 학습 이득 미미.
+       * Too-hard (Bucket 0): 현재 모델 역량으로 해결 불가, 탐색 비용만 소모.
+       * Solvability Gap (Bucket A): 집중 공략 대상. 시도하면 맞출 가능성이 있는 구간.
+   * 데이터 불일치: Phase 1 로그(약 7.9k)와 현재 학습 데이터(6.6k) 간 불일치가 존재하여, "확실하게
+     매칭되는 데이터(Strategy 1)"만 보수적으로 사용하는 전략을 채택함.
+
+  3. 핵심 정의 및 데이터 소스
+
+  3.1 데이터 소스
+   * Score Source: logs/gspo_phase1.json (Phase 1 실행 로그, Agent 5명의 궤적 포함)
+   * Data Source: data/rag/slidevqa_train_6667.parquet (Phase 2 공식 학습셋)
+
+  3.2 난이도 지표 (Metric)
+   * Average NDCG: 각 UID별 5개 Agent의 ndcg_value 평균값.
+
+  3.3 커리큘럼 버킷 (Bucketing)
+
+  ┌──────────┬────────────────┬───────────────┬─────────────────────────┬──────────────────────┐
+  │ 버킷     │ 조건 (Avg N... │ 개수 (Matc... │ 의미                    │ 처리 방침            │
+  ├──────────┼────────────────┼───────────────┼─────────────────────────┼──────────────────────┤
+  │ Bucket B │ > 0.7          │ 2,791개       │ Mastered (이미 잘함)    │ 학습 제외            │
+  │ Bucket A │ 0.1 ~ 0.7      │ 1,560개       │ Target (학습 최적 구간) │ 커리큘럼 학습 투입   │
+  │ Bucket 0 │ < 0.1          │ 637개         │ Unsolvable (너무 어...  │ 학습 제외 (추후 ...  │
+  │ *Unma... │ N/A            │ 1,679개       │ 기록 없음               │ 보수적 관점에서 제외 │
+  └──────────┴────────────────┴───────────────┴─────────────────────────┴──────────────────────┘
+
+  4. 구현 상세 (Implementation Details)
+
+  4.1 전처리 파이프라인 (scripts/generate_curriculum_data.py)
+   1. 매칭 (Matching): 로그의 reference_documents에서 UID 추출 → 학습셋의 id와 Inner Join.
+   2. 필터링 (Filtering): Bucket A 조건(0.1 <= score <= 0.7)에 맞는 데이터만 추출.
+   3. 정렬 (Sorting): Easy-to-Hard 전략 구현.
+       * ndcg_score 기준 내림차순 정렬 (0.7 $\to$ 0.1).
+       * 학습 초기에 성공 경험을 강화하고 점차 난이도를 높임.
+   4. 메타데이터 주입: 추후 분석을 위해 각 샘플의 extra_info 필드에 phase1_ndcg 값을 추가 기록.
+
+  4.2 데이터셋 산출물
+   * Target: data/curriculum_bucket_a.parquet (1,560 samples, Sorted)
+   * Reference: data/curriculum_bucket_b.parquet, data/curriculum_bucket_0.parquet
+
+  4.3 학습 설정 변경 (Critical Configuration)
+  커리큘럼 순서를 유지하기 위해 verl 트레이너의 기본 동작을 수정함.
+
+   * Config 수정: verl/trainer/config/ppo_trainer.yaml
+       * data.shuffle: True $\to$ `False` (필수)
+       * 효과: RandomSampler 대신 SequentialSampler가 작동하여 Parquet 파일의 정렬 순서 그대로
+         학습 진행. 재개(Resume) 시에도 순서 유지.
+   * Execution Script: gspo_phase2_gemini_flash.sh
+       * data.train_files: ./data/curriculum_bucket_a.parquet 지정.
+       * NDCG_DEBUG=1: NDCG 상세 로깅 활성화 (학습 후 Case 분석용).
+
+  5. 기대 효과 및 향후 계획
+
+   * 학습 효율: 전체 데이터(6.6k) 대비 약 23%(1.5k)의 핵심 데이터에 집중하되, API 비용은
+     획기적으로 절감하며 성능 향상 기대.
+   * 안정성: 쉬운 예제부터 학습하므로 초기 RL 학습의 발산(Collapse) 위험 감소.
+   * Phase 3 연계: 생성된 로그(gspo_gemini_output.jsonl)에는 judge_score와 ndcg가 모두 기록되므로,
+     이를 바탕으로 "근거 부족 정답(Guessing)" vs "근거 충분 오답(Reasoning Failure)"을 구분하여
+     2차 심화 학습 진행 가능.
+
+-----
+
+이때, 기존에 이러한 식으로 계획을 세워 보았는데, 현재 이제 구현을 하고 실행을 하는 중이잖아. 너가 이러한 구현 / 실행 사실과 디테일한 면을 알고 있으니 이를 보강해 줘.
+
+이러한 식으로 계획을 짜 보았는데, 엄격하고 치밀하게 관련 코드를 살펴봐 가면서 검토해 줘. 아직 코드를 수정하지는 말고, 브레인스토밍부터 해 보자.
