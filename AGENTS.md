@@ -79,6 +79,9 @@ Per-file summaries:
 - `docs/HALF_OR_LESS_THINK_SFT_PIPELINE.md`
   - Pipeline to distill rare-success RL trajectories into SFT data by rewriting `<think>` only (keeping actions unchanged).
 
+- `docs/SFT_SUCCESS_ONLY_CURATION_SPEC.md`
+  - “성공 샘플만” SFT를 위한 큐레이션 스펙(리라이팅 0%, `judge==1 & ndcg>0`만, 그룹 난이도 필터, GPT pass/fail 최종 검수, 그룹당 최대 4개).
+
 - `docs/DDAI-46.txt` / `docs/DDAI-47.txt`
   - Early design drafts for curriculum learning and focused RL “compute curriculum” (round-based approach).
   - Useful as intent/strategy context; validate against current scripts and configs.
@@ -109,6 +112,27 @@ Per-file summaries:
 - If auto-resume fails (wrong CWD / different `trainer.experiment_name`), force it with a path override:
   - `trainer.default_local_dir=./checkpoints/gspo_phase2_gemini_flash_curriculum_focused_round_3`
   - `trainer.resume_mode=./checkpoints/gspo_phase2_gemini_flash_curriculum_focused_round_3/global_step_16`
+
+---
+
+## Recent findings (logs-based, for future runs)
+
+- Focused2 vs Focused3 v2 behavior shift analysis: `docs/focused3_v2_behavior_shift_analysis.md`.
+- In `focused3_v2` (post-SFT checkpoint + `max_turns=10`), observed a new failure mode: **~10% 0-search rollouts** (`#<search>=0`) with many `<bbox>` actions, which is RAG-misaligned and can still receive judge=1 in rare cases.
+- In `focused3_v2`, `ndcg>0` rate appears lower than in Focused2, consistent with “fewer searches / more bbox” shift under Judge-only reward.
+- “Empty plan” outputs (`model.plan` equal to `<|im_end|>`) are more frequent in v2 than in Focused2; treat as a “format/behavior collapse” indicator to monitor.
+- New SFT direction (planned): **리라이팅 대신 “성공 샘플만” 큐레이션 후 SFT**.
+  - Source logs: `logs/focused2/`, `logs/focused3/`, `logs/focused3_v2/`
+  - Keep only `judge==1 AND ndcg>0 AND search_complete` samples with no system errors (e.g. bbox crop failure).
+  - Hard-only filter: discard prompt-groups where `judge==1` count > 8 (too easy); keep <=8.
+  - Cap to max 4 samples per prompt-group, prefer efficiency (high ndcg, fewer searches/bboxes, shorter traj).
+  - Run GPT **pass/fail final vetting** over all candidates; drop `pass=false` with no exceptions.
+  - Full spec: `docs/SFT_SUCCESS_ONLY_CURATION_SPEC.md`
+  - Implementation scripts:
+    - Candidate export: `scripts/extract_trajectories.py` with `--min-judge-score`, `--group-success-metric judge`, `--export-extra-metrics`
+    - GPT vetting: `scripts/vet_sft_rollouts_gpt.py`
+    - Final cap/train1 output: `scripts/finalize_success_only_sft_dataset.py`
+    - One-shot (multi-stage) runner: `scripts/run_success_only_sft_all.sh` (optionally `--merge`)
 
 ---
 

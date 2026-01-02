@@ -449,6 +449,7 @@ def to_train1_parquet_rows(
     system_prompt: str,
     strict_action_tag: bool = True,
     synthesize_missing_tool_outputs: bool = True,
+    drop_system_errors: bool = False,
 ) -> List[Dict[str, str]]:
     rows: List[Dict[str, str]] = []
 
@@ -468,6 +469,17 @@ def to_train1_parquet_rows(
             )
             if not messages:
                 continue
+            if drop_system_errors:
+                has_err = False
+                for m in messages:
+                    if (m.get("role") or "") != "user":
+                        continue
+                    c = m.get("content")
+                    if isinstance(c, str) and "[System Error:" in c:
+                        has_err = True
+                        break
+                if has_err:
+                    continue
 
             rm = next((e for e in events if e.get("event_type") in ("rm.flash.detail", "rm.phase1.detail")), {})
             run_id = rm.get("run_id") or ""
@@ -492,12 +504,15 @@ def to_train1_parquet_rows(
 def filter_trajectories(
     data: Dict[str, Any],
     min_score: float = 0.0,
+    min_judge_score: Optional[float] = None,
     min_ndcg: float = 0.0,
     max_turns: Optional[int] = None,
     best_only: bool = False,
     min_success_rate: float = 0.0,
     max_success_rate: Optional[float] = None,
     top_k: Optional[int] = None,
+    group_success_metric: str = "score",
+    group_success_threshold: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Trajectory 필터링
@@ -513,10 +528,24 @@ def filter_trajectories(
     """
     filtered_samples = {}
 
+    metric = (group_success_metric or "score").strip().lower()
+    if metric not in ("score", "judge"):
+        metric = "score"
+
     for uid, sample in data['samples'].items():
         # 성공률 계산
         total = len(sample['rollouts'])
-        success = sum(1 for r in sample['rollouts'] if r['score'] >= min_score)
+        threshold = group_success_threshold
+        if threshold is None:
+            if metric == "judge":
+                threshold = 1.0 if min_judge_score is None else float(min_judge_score)
+            else:
+                threshold = float(min_score)
+
+        if metric == "judge":
+            success = sum(1 for r in sample["rollouts"] if float(r.get("judge_score", 0.0)) >= float(threshold))
+        else:
+            success = sum(1 for r in sample["rollouts"] if float(r.get("score", 0.0)) >= float(threshold))
         success_rate = success / total if total > 0 else 0
 
         if success_rate < min_success_rate:
@@ -528,6 +557,8 @@ def filter_trajectories(
         filtered_rollouts = []
         for rollout in sample['rollouts']:
             if rollout['score'] < min_score:
+                continue
+            if min_judge_score is not None and float(rollout.get("judge_score", 0.0)) < float(min_judge_score):
                 continue
             if rollout['ndcg'] < min_ndcg:
                 continue
@@ -553,19 +584,23 @@ def filter_trajectories(
             **sample,
             'rollouts': filtered_rollouts,
             'num_rollouts': len(filtered_rollouts),
-            'success_rate': success_rate
+            'success_rate': success_rate,
+            'success_count': success,
         }
 
     return {
         'metadata': data['metadata'],
         'filter_config': {
             'min_score': min_score,
+            'min_judge_score': min_judge_score,
             'min_ndcg': min_ndcg,
             'max_turns': max_turns,
             'best_only': best_only,
             'min_success_rate': min_success_rate,
             'max_success_rate': max_success_rate,
             'top_k': top_k,
+            'group_success_metric': metric,
+            'group_success_threshold': group_success_threshold,
         },
         'samples': filtered_samples
     }
@@ -690,6 +725,8 @@ def main():
     parser.add_argument('--input', '-i', required=True, help='Input log file (jsonl)')
     parser.add_argument('--output', '-o', required=True, help='Output file (json)')
     parser.add_argument('--min-score', type=float, default=0.0, help='Minimum score filter')
+    parser.add_argument('--min-judge-score', type=float, default=None,
+                        help='Minimum judge_score filter (rollout-level). If set, rollouts with judge_score < this are dropped.')
     parser.add_argument('--min-ndcg', type=float, default=0.0, help='Minimum NDCG filter')
     parser.add_argument('--max-turns', type=int, default=None, help='Maximum turns filter')
     parser.add_argument('--best-only', action='store_true', help='Keep only best rollout per sample')
@@ -697,17 +734,25 @@ def main():
                         help='Keep only top-K rollouts per sample (sorted by score, then ndcg). Ignored if <=0.')
     parser.add_argument('--min-success-rate', type=float, default=0.0, help='Minimum success rate filter')
     parser.add_argument('--max-success-rate', type=float, default=None, help='Maximum success rate filter (default: None)')
+    parser.add_argument('--group-success-metric', type=str, default="score", choices=["score", "judge"],
+                        help='Metric for computing group success_rate/success_count: score or judge (default: score).')
+    parser.add_argument('--group-success-threshold', type=float, default=None,
+                        help='Threshold used for group success counting. If unset, uses min-score (score) or min-judge-score/1.0 (judge).')
     parser.add_argument('--sft-format', action='store_true', help='Output in SFT format')
     parser.add_argument('--include-raw', action='store_true', help='Include raw trajectory in SFT format')
     parser.add_argument('--stats', action='store_true', help='Print statistics')
     parser.add_argument('--export-train1-parquet', action='store_true',
                         help='Export SFT dataset in train1.parquet-compatible schema (uid/format_version/messages)')
+    parser.add_argument('--export-extra-metrics', action='store_true',
+                        help='When exporting parquet, also include helper columns (prompt_uid/sample_idx/score/judge_score/ndcg/num_turns/run_id).')
     parser.add_argument('--system-prompt', type=str, default=DEFAULT_SYSTEM_PROMPT_V1,
                         help='System prompt to use for train1-compatible messages')
     parser.add_argument('--allow-invalid-actions', action='store_true',
                         help='Do not drop samples with invalid action-tag formatting (train1 export only)')
     parser.add_argument('--no-synthesize-missing-tools', action='store_true',
                         help='Do not synthesize missing tool outputs; drop rollouts when tool outputs are missing (train1 export only)')
+    parser.add_argument('--drop-system-errors', action='store_true',
+                        help='When exporting train1 messages, drop rollouts that contain any "[System Error:" user message.')
 
     args = parser.parse_args()
 
@@ -722,29 +767,36 @@ def main():
     # 필터링
     if (
         args.min_score > 0
+        or args.min_judge_score is not None
         or args.min_ndcg > 0
         or args.max_turns
         or args.best_only
         or args.top_k
         or args.min_success_rate > 0
         or args.max_success_rate is not None
+        or (args.group_success_metric or "score") != "score"
+        or args.group_success_threshold is not None
     ):
         print(
             "Filtering ("
-            f"score>={args.min_score}, ndcg>={args.min_ndcg}, turns<={args.max_turns}, "
+            f"score>={args.min_score}, judge>={args.min_judge_score}, ndcg>={args.min_ndcg}, turns<={args.max_turns}, "
             f"best_only={args.best_only}, top_k={args.top_k}, "
-            f"success_rate>={args.min_success_rate}, success_rate<={args.max_success_rate}"
+            f"success_rate>={args.min_success_rate}, success_rate<={args.max_success_rate}, "
+            f"group_success_metric={args.group_success_metric}, group_success_threshold={args.group_success_threshold}"
             ")..."
         )
         data = filter_trajectories(
             data,
             min_score=args.min_score,
+            min_judge_score=args.min_judge_score,
             min_ndcg=args.min_ndcg,
             max_turns=args.max_turns,
             best_only=args.best_only,
             min_success_rate=args.min_success_rate,
             max_success_rate=args.max_success_rate,
             top_k=args.top_k,
+            group_success_metric=args.group_success_metric,
+            group_success_threshold=args.group_success_threshold,
         )
         print(f"After filtering: {len(data['samples'])} samples")
 
@@ -765,6 +817,7 @@ def main():
             system_prompt=args.system_prompt,
             strict_action_tag=not args.allow_invalid_actions,
             synthesize_missing_tool_outputs=not args.no_synthesize_missing_tools,
+            drop_system_errors=bool(args.drop_system_errors),
         )
         print(f"Exporting train1-compatible rows: {len(rows)}")
         if not rows:
@@ -772,6 +825,38 @@ def main():
 
         import pandas as pd
         df = pd.DataFrame(rows, columns=["uid", "format_version", "messages"])
+        if args.export_extra_metrics:
+            # Add helper columns by looking up rm events again (best-effort).
+            # This is useful for downstream curation (ranking/capping) but should be stripped before training.
+            meta = []
+            for r in rows:
+                out_uid = str(r.get("uid", ""))
+                # out_uid looks like "{prompt_uid}__s{sample_idx}__{run_suffix?}"
+                prompt_uid = out_uid.split("__s", 1)[0] if "__s" in out_uid else out_uid
+                sample_idx = None
+                m = re.search(r"__s(\d+)", out_uid)
+                if m:
+                    try:
+                        sample_idx = int(m.group(1))
+                    except Exception:
+                        sample_idx = None
+                evs = None
+                if sample_idx is not None:
+                    evs = events_by_uid_sample.get((prompt_uid, sample_idx))
+                rm = next((e for e in (evs or []) if e.get("event_type") in ("rm.flash.detail", "rm.phase1.detail")), {}) if evs else {}
+                meta.append(
+                    {
+                        "prompt_uid": prompt_uid,
+                        "sample_idx": sample_idx,
+                        "score": float(rm.get("final_score", 0.0) or 0.0),
+                        "judge_score": float(rm.get("judge_score", 0.0) or 0.0),
+                        "ndcg": float(rm.get("ndcg", 0.0) or 0.0),
+                        "num_turns": int(rm.get("num_turns", 0) or 0),
+                        "run_id": rm.get("run_id") or "",
+                    }
+                )
+            for k in meta[0].keys() if meta else []:
+                df[k] = [m.get(k) for m in meta]
         df.to_parquet(output_path, engine="pyarrow", index=False)
         print(f"Saved to {output_path}")
         return

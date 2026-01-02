@@ -59,7 +59,7 @@ export API_LATENCY_SAMPLE_SIZE=5000
 # Unified trajectory logging (single JSONL)
 # =============================================================================
 export UNIFIED_LOG_ENABLE=1
-export UNIFIED_LOG_PATH=./logs/focused3/unified_trajectory.jsonl
+export UNIFIED_LOG_PATH=./logs/focused3_v2/unified_trajectory.jsonl
 export UNIFIED_LOG_CLIENT_BATCH_SIZE=200
 export UNIFIED_LOG_CLIENT_FLUSH_INTERVAL_S=1.0
 export UNIFIED_LOG_WRITER_FLUSH_EVERY_N=2000
@@ -160,7 +160,7 @@ n_gpus=8
 # - train_batch_size: 원본 프롬프트 수
 # - n_agent: 프롬프트당 생성할 응답 수
 # - 실제 배치 크기 = train_batch_size × n_agent
-train_batch_size=16
+train_batch_size=32
 ppo_mini_batch_size=8
 ppo_micro_batch_size_per_gpu=1
 log_prob_micro_batch_size_per_gpu=1
@@ -175,7 +175,7 @@ max_turns=10
 # 4. Gemini VLM Judge 설정
 # =============================================================================
 # 로그 경로 (JSONL 형식)
-log_path="./logs/focused3/gspo_gemini_output.jsonl"
+log_path="./logs/focused3_v2/gspo_gemini_output.jsonl"
 
 # 이미지 기본 경로 (검색된 이미지 및 정답 이미지)
 image_base_path="./data/images"
@@ -220,7 +220,7 @@ search_url="http://163.239.28.21:5002/search"
 # =============================================================================
 # 6. 로그 디렉토리 생성
 # =============================================================================
-mkdir -p ./logs/focused3
+mkdir -p ./logs/focused3_v2
 echo ">>> 로그 경로: $log_path"
 
 # =============================================================================
@@ -253,7 +253,7 @@ echo "=========================================="
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    data.train_files=./data/focused_round2.parquet \
+    data.train_files=./data/focused_round1.parquet \
     data.val_files=./data/rag/overall_test_crop.parquet \
     data.train_batch_size=$train_batch_size \
     data.max_prompt_length=256 \
@@ -313,7 +313,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger=['wandb','console'] \
     trainer.project_name=gspo_phase2_gemini \
-    trainer.experiment_name=gspo_phase2_gemini_flash_curriculum_focused_round_3 \
+    trainer.experiment_name=gspo_phase2_gemini_flash_curriculum_focused_round_3_v2 \
     trainer.n_gpus_per_node=$n_gpus \
     trainer.nnodes=1 \
     trainer.save_freq=10 \

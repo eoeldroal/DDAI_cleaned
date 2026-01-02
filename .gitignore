@@ -1,6 +1,3 @@
-
-data/*
-!data/rag/
 test.sh
 **/corpus/*
 !search_engine/corpus/colqwen_ingestion/
